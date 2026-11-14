@@ -2,12 +2,16 @@ package torrent
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
+	"syscall"
 
-	"github.com/anacrolix/missinggo"
-	"github.com/anacrolix/missinggo/perf"
-	"github.com/pkg/errors"
+	g "github.com/anacrolix/generics"
+	utp "github.com/anacrolix/go-utp"
+	"github.com/anacrolix/missinggo/v2"
 )
 
 type Listener interface {
@@ -24,33 +28,111 @@ type socket interface {
 	Close() error
 }
 
-func listen(n network, addr string, f firewallCallback) (socket, error) {
+func listen(n network, addr string, f firewallCallback, logger *slog.Logger) (socket, error) {
 	switch {
 	case n.Tcp:
 		return listenTcp(n.String(), addr)
 	case n.Udp:
-		return listenUtp(n.String(), addr, f)
+		return listenUtp(n.String(), addr, f, logger)
 	default:
 		panic(n)
 	}
 }
 
+// Dialing TCP from a local port limits us to a single outgoing TCP connection to each remote
+// client. Instead, this should be a last resort if we need to use holepunching, and only then to
+// connect to other clients that actually try to holepunch TCP.
+const dialTcpFromListenPort = false
+
+var SocketIPTypeOfService = 0
+
+var tcpListenConfig = net.ListenConfig{
+	Control: func(network, address string, c syscall.RawConn) (err error) {
+		controlErr := c.Control(func(fd uintptr) {
+			if dialTcpFromListenPort {
+				err = setReusePortSockOpts(fd)
+			}
+			if err == nil && SocketIPTypeOfService != 0 {
+				err = setSockIPTOS(fd, SocketIPTypeOfService)
+			}
+		})
+		if err != nil {
+			return
+		}
+		err = controlErr
+		return
+	},
+	// BitTorrent connections manage their own keep-alives.
+	KeepAlive: -1,
+}
+
 func listenTcp(network, address string) (s socket, err error) {
-	l, err := net.Listen(network, address)
-	return tcpSocket{
-		Listener: l,
-		NetDialer: NetDialer{
-			Network: network,
+	l, err := tcpListenConfig.Listen(context.Background(), network, address)
+	if err != nil {
+		return
+	}
+	netDialer := net.Dialer{
+		// We don't want fallback, as we explicitly manage the IPv4/IPv6 distinction ourselves,
+		// although it's probably not triggered as I think the network is already constrained to
+		// tcp4 or tcp6 at this point.
+		FallbackDelay: -1,
+		// BitTorrent connections manage their own keepalives.
+		KeepAlive: tcpListenConfig.KeepAlive,
+		Control: func(network, address string, c syscall.RawConn) (err error) {
+			controlErr := c.Control(func(fd uintptr) {
+				err = setSockNoLinger(fd)
+				if err != nil {
+					// Failing to disable linger is undesirable, but not fatal.
+					slog.Debug("error setting linger socket option on tcp socket", "err", err)
+					err = nil
+				}
+				// This is no longer required I think, see
+				// https://github.com/anacrolix/torrent/discussions/856. I added this originally to
+				// allow dialling out from the client's listen port, but that doesn't really work. I
+				// think Linux older than ~2013 doesn't support SO_REUSEPORT.
+				if dialTcpFromListenPort {
+					err = setReusePortSockOpts(fd)
+				}
+				if err == nil && SocketIPTypeOfService != 0 {
+					err = setSockIPTOS(fd, SocketIPTypeOfService)
+				}
+			})
+			if err == nil {
+				err = controlErr
+			}
+			return
 		},
-	}, err
+	}
+	if dialTcpFromListenPort {
+		netDialer.LocalAddr = l.Addr()
+	}
+	s = tcpSocket{
+		Listener: l,
+		NetworkDialer: NetworkDialer{
+			Network: network,
+			Dialer:  &netDialer,
+		},
+	}
+	return
 }
 
 type tcpSocket struct {
 	net.Listener
-	NetDialer
+	NetworkDialer
 }
 
-func listenAll(networks []network, getHost func(string) string, port int, f firewallCallback) ([]socket, error) {
+type listenFunc func(n network, addr string, f firewallCallback, logger *slog.Logger) (socket, error)
+
+const listenAllRetryLimit = 150
+
+func listenAllWithListenFunc(
+	networks []network,
+	getHost func(string) string,
+	port int,
+	f firewallCallback,
+	logger *slog.Logger,
+	lf listenFunc,
+) ([]socket, error) {
 	if len(networks) == 0 {
 		return nil, nil
 	}
@@ -58,10 +140,15 @@ func listenAll(networks []network, getHost func(string) string, port int, f fire
 	for _, n := range networks {
 		nahs = append(nahs, networkAndHost{n, getHost(n.String())})
 	}
+	retries := 0
 	for {
-		ss, retry, err := listenAllRetry(nahs, port, f)
+		ss, retry, err := listenAllRetry(nahs, port, f, logger, lf)
 		if !retry {
 			return ss, err
+		}
+		retries++
+		if retries >= listenAllRetryLimit {
+			return nil, err
 		}
 	}
 }
@@ -71,13 +158,25 @@ type networkAndHost struct {
 	Host    string
 }
 
-func listenAllRetry(nahs []networkAndHost, port int, f firewallCallback) (ss []socket, retry bool, err error) {
-	ss = make([]socket, 1, len(nahs))
-	portStr := strconv.FormatInt(int64(port), 10)
-	ss[0], err = listen(nahs[0].Network, net.JoinHostPort(nahs[0].Host, portStr), f)
-	if err != nil {
-		return nil, false, errors.Wrap(err, "first listen")
+// Reports whether a listen failed because the host can't use that network at all, so it should be
+// skipped rather than treated as fatal. The errnos are per platform, see unsupportedNetworkErrnos.
+func isUnsupportedNetworkError(err error) bool {
+	for _, errno := range unsupportedNetworkErrnos {
+		if errors.Is(err, errno) {
+			return true
+		}
 	}
+	return false
+}
+
+func listenAllRetry(
+	nahs []networkAndHost,
+	port int,
+	f firewallCallback,
+	logger *slog.Logger,
+	lf listenFunc,
+) (ss []socket, retry bool, err error) {
+	// Close all sockets on error or retry.
 	defer func() {
 		if err != nil || retry {
 			for _, s := range ss {
@@ -86,32 +185,57 @@ func listenAllRetry(nahs []networkAndHost, port int, f firewallCallback) (ss []s
 			ss = nil
 		}
 	}()
-	portStr = strconv.FormatInt(int64(missinggo.AddrPort(ss[0].Addr())), 10)
-	for _, nah := range nahs[1:] {
-		s, err := listen(nah.Network, net.JoinHostPort(nah.Host, portStr), f)
+	g.MakeSliceWithCap(&ss, len(nahs))
+	portStr := strconv.FormatInt(int64(port), 10)
+	for _, nah := range nahs {
+		var s socket
+		s, err = lf(nah.Network, net.JoinHostPort(nah.Host, portStr), f, logger)
 		if err != nil {
-			return ss,
-				missinggo.IsAddrInUse(err) && port == 0,
-				errors.Wrap(err, "subsequent listen")
+			if isUnsupportedNetworkError(err) {
+				err = nil
+				continue
+			}
+			if len(ss) == 0 {
+				// First relative to a possibly dynamic port (0).
+				err = fmt.Errorf("first listen: %w", err)
+			} else {
+				err = fmt.Errorf("subsequent listen: %w", err)
+			}
+			retry = port == 0 && len(ss) > 0
+			return
 		}
 		ss = append(ss, s)
+		portStr = strconv.FormatInt(int64(missinggo.AddrPort(ss[0].Addr())), 10)
 	}
 	return
 }
 
-type firewallCallback func(net.Addr) bool
+type firewallCallback = utp.FirewallCallback
 
-func listenUtp(network, addr string, fc firewallCallback) (socket, error) {
-	us, err := NewUtpSocket(network, addr, fc)
+func listenUtp(network, addr string, fc firewallCallback, logger *slog.Logger) (socket, error) {
+	us, err := NewUtpSocketSlogger(network, addr, fc, logger)
 	return utpSocketSocket{us, network}, err
 }
 
+func listenUtpFromPacketConn(network, addr string, fc firewallCallback, logger *slog.Logger, lp func(network, addr string) (net.PacketConn, error)) (socket, error) {
+	pc, err := lp(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	us, err := NewUtpSocketFromPacketConn(pc, fc, logger)
+	return utpSocketSocket{us, network}, err
+}
+
+// utpSocket wrapper, additionally wrapped for the torrent package's socket interface.
 type utpSocketSocket struct {
 	utpSocket
 	network string
 }
 
+func (me utpSocketSocket) DialerNetwork() string {
+	return me.network
+}
+
 func (me utpSocketSocket) Dial(ctx context.Context, addr string) (conn net.Conn, err error) {
-	defer perf.ScopeTimerErr(&err)()
 	return me.utpSocket.DialContext(ctx, me.network, addr)
 }

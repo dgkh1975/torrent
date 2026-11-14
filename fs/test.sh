@@ -1,17 +1,37 @@
-set -ex
-repopath=$(cd $(dirname $0)/..; pwd)
-d=$(mktemp -d)
-pushd "$d"
-mkdir mnt torrents
-GOPPROF=http torrentfs -mountDir=mnt -metainfoDir=torrents &
-trap 'set +e; sudo umount -f mnt; pushd; rm -rv "$d"' EXIT
+#!/usr/bin/env bash
+echo BASH_VERSION="$BASH_VERSION"
+set -eux
+repopath="$(cd "$(dirname "$0")/.."; pwd)"
+debian_file=debian-10.8.0-amd64-netinst.iso
+mkdir -p mnt torrents
+# I think the timing can cause torrents to not get added correctly to the torrentfs client, so add
+# them first and start the fs afterwards.
 pushd torrents
-cp "$repopath"/testdata/debian-9.1.0-amd64-netinst.iso.torrent .
-echo 'magnet:?xt=urn:btih:6a9759bffd5c0af65319979fb7832189f4f3c35d&dn=sintel.mp4' > sintel.magnet
+cp "$repopath/testdata/$debian_file.torrent" .
+godo -v -- "$repopath/cmd/torrent" metainfo "$repopath/testdata/sintel.torrent" magnet > sintel.magnet
 popd
-file=debian-9.1.0-amd64-netinst.iso
-# file=sintel.mp4
-while [ ! -e "mnt/$file" ]; do sleep 1; done
-pv "mnt/$file" | md5sum
+#file="$debian_file"
+file=Sintel/Sintel.mp4
+
+GOPPROF=http godo -v -- "$repopath/fs/cmd/torrentfs" -mountDir=mnt -metainfoDir=torrents &> torrentfs.log &
+torrentfs_pid=$!
+trap 'kill "$torrentfs_pid"' EXIT
+
+check_file() {
+	while [ ! -e "mnt/$file" ]; do sleep 1; done
+	pv -f "mnt/$file" | gmd5sum -c <(cat <<-EOF
+	083e808d56aa7b146f513b3458658292  -
+	EOF
+	)
+}
+
+( check_file ) &
+check_file_pid=$!
+
+trap 'kill "$torrentfs_pid" "$check_file_pid"' EXIT
+wait -n
+status=$?
 sudo umount mnt
-wait || echo "wait returned" $?
+trap - EXIT
+echo "wait returned" $status
+exit $status

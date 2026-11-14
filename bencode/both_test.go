@@ -2,16 +2,15 @@ package bencode
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	qt "github.com/go-quicktest/qt"
 )
 
 func loadFile(name string, t *testing.T) []byte {
-	data, err := ioutil.ReadFile(name)
-	require.NoError(t, err)
+	data, err := os.ReadFile(name)
+	qt.Assert(t, qt.IsNil(err))
 	return data
 }
 
@@ -20,12 +19,12 @@ func testFileInterface(t *testing.T, filename string) {
 
 	var iface interface{}
 	err := Unmarshal(data1, &iface)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 
 	data2, err := Marshal(iface)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 
-	assert.EqualValues(t, data1, data2)
+	qt.Check(t, qt.DeepEquals(data2, data1))
 }
 
 func TestBothInterface(t *testing.T) {

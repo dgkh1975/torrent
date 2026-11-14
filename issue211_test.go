@@ -1,12 +1,13 @@
+//go:build !wasm
+// +build !wasm
+
 package torrent
 
 import (
 	"io"
-	"io/ioutil"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	qt "github.com/go-quicktest/qt"
 	"golang.org/x/time/rate"
 
 	"github.com/anacrolix/torrent/internal/testutil"
@@ -14,24 +15,27 @@ import (
 )
 
 func TestDropTorrentWithMmapStorageWhileHashing(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	// Ensure the data is present when the torrent is added, and not obtained
 	// over the network as the test runs.
 	cfg.DownloadRateLimiter = rate.NewLimiter(0, 0)
+	cfg.DialForPeerConns = false
+	cfg.AcceptPeerConnections = false
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 
 	td, mi := testutil.GreetingTestTorrent()
-	tt, new, err := cl.AddTorrentSpec(&TorrentSpec{
-		Storage:   storage.NewMMap(td),
+	mms := storage.NewMMap(td)
+	defer mms.Close()
+	tt, new := cl.AddTorrentOpt(AddTorrentOpts{
+		Storage:   mms,
 		InfoHash:  mi.HashInfoBytes(),
 		InfoBytes: mi.InfoBytes,
 	})
-	require.NoError(t, err)
-	assert.True(t, new)
+	qt.Check(t, qt.IsTrue(new))
 
 	r := tt.NewReader()
 	go tt.Drop()
-	io.Copy(ioutil.Discard, r)
+	io.Copy(io.Discard, r)
 }

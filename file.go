@@ -1,21 +1,29 @@
 package torrent
 
 import (
-	"strings"
+	"iter"
 
-	"github.com/anacrolix/missinggo/v2/bitmap"
+	"github.com/RoaringBitmap/roaring/v2"
+	g "github.com/anacrolix/generics"
 
 	"github.com/anacrolix/torrent/metainfo"
+	infohash_v2 "github.com/anacrolix/torrent/types/infohash-v2"
 )
 
 // Provides access to regions of torrent data that correspond to its files.
 type File struct {
-	t      *Torrent
-	path   string
-	offset int64
-	length int64
-	fi     metainfo.FileInfo
-	prio   piecePriority
+	t           *Torrent
+	path        string
+	offset      int64
+	length      int64
+	fi          metainfo.FileInfo
+	displayPath string
+	prio        PiecePriority
+	piecesRoot  g.Option[infohash_v2.T]
+}
+
+func (f *File) String() string {
+	return f.Path()
 }
 
 func (f *File) Torrent() *Torrent {
@@ -28,12 +36,12 @@ func (f *File) Offset() int64 {
 }
 
 // The FileInfo from the metainfo.Info to which this file corresponds.
-func (f File) FileInfo() metainfo.FileInfo {
+func (f *File) FileInfo() metainfo.FileInfo {
 	return f.fi
 }
 
-// The file's path components joined by '/'.
-func (f File) Path() string {
+// The file's path components including the directory name joined by '/'.
+func (f *File) Path() string {
 	return f.path
 }
 
@@ -44,13 +52,14 @@ func (f *File) Length() int64 {
 
 // Number of bytes of the entire file we have completed. This is the sum of
 // completed pieces, and dirtied chunks of incomplete pieces.
-func (f *File) BytesCompleted() int64 {
+func (f *File) BytesCompleted() (n int64) {
 	f.t.cl.rLock()
-	defer f.t.cl.rUnlock()
-	return f.bytesCompleted()
+	n = f.bytesCompletedLocked()
+	f.t.cl.rUnlock()
+	return
 }
 
-func (f *File) bytesCompleted() int64 {
+func (f *File) bytesCompletedLocked() int64 {
 	return f.length - f.bytesLeft()
 }
 
@@ -60,42 +69,74 @@ func fileBytesLeft(
 	fileEndPieceIndex int,
 	fileTorrentOffset int64,
 	fileLength int64,
-	torrentCompletedPieces bitmap.Bitmap,
+	torrentCompletedPieces *roaring.Bitmap,
+	pieceSizeCompletedFn func(pieceIndex int) int64,
 ) (left int64) {
-	numPiecesSpanned := fileEndPieceIndex - fileFirstPieceIndex
-	switch numPiecesSpanned {
-	case 0:
-	case 1:
-		if !torrentCompletedPieces.Get(fileFirstPieceIndex) {
-			left += fileLength
-		}
-	default:
-		if !torrentCompletedPieces.Get(fileFirstPieceIndex) {
-			left += torrentUsualPieceSize - (fileTorrentOffset % torrentUsualPieceSize)
-		}
-		if !torrentCompletedPieces.Get(fileEndPieceIndex - 1) {
-			left += fileTorrentOffset + fileLength - int64(fileEndPieceIndex-1)*torrentUsualPieceSize
-		}
-		completedMiddlePieces := torrentCompletedPieces.Copy()
-		completedMiddlePieces.RemoveRange(0, fileFirstPieceIndex+1)
-		completedMiddlePieces.RemoveRange(fileEndPieceIndex-1, bitmap.ToEnd)
-		left += int64(numPiecesSpanned-2-completedMiddlePieces.Len()) * torrentUsualPieceSize
+	if fileLength == 0 {
+		return
 	}
+
+	noCompletedMiddlePieces := roaring.New()
+	noCompletedMiddlePieces.AddRange(uint64(fileFirstPieceIndex), uint64(fileEndPieceIndex))
+	noCompletedMiddlePieces.AndNot(torrentCompletedPieces)
+	noCompletedMiddlePieces.Iterate(func(pieceIndex uint32) bool {
+		i := int(pieceIndex)
+		pieceSizeCompleted := pieceSizeCompletedFn(i)
+		switch i {
+		case fileFirstPieceIndex:
+			beginOffset := fileTorrentOffset % torrentUsualPieceSize
+			beginSize := torrentUsualPieceSize - beginOffset
+			beginDownLoaded := pieceSizeCompleted - beginOffset
+			if beginDownLoaded < 0 {
+				beginDownLoaded = 0
+			}
+			left += beginSize - beginDownLoaded
+		case fileEndPieceIndex - 1:
+			endSize := (fileTorrentOffset + fileLength) % torrentUsualPieceSize
+			if endSize == 0 {
+				endSize = torrentUsualPieceSize
+			}
+			endDownloaded := pieceSizeCompleted
+			if endDownloaded > endSize {
+				endDownloaded = endSize
+			}
+			left += endSize - endDownloaded
+		default:
+			left += torrentUsualPieceSize - pieceSizeCompleted
+		}
+		return true
+	})
+
+	if left > fileLength {
+		left = fileLength
+	}
+	//
+	//numPiecesSpanned := f.EndPieceIndex() - f.BeginPieceIndex()
+	//completedMiddlePieces := f.t._completedPieces.Clone()
+	//completedMiddlePieces.RemoveRange(0, uint64(f.BeginPieceIndex()+1))
+	//completedMiddlePieces.RemoveRange(uint64(f.EndPieceIndex()-1), roaring.MaxRange)
+	//left += int64(numPiecesSpanned-2-pieceIndex(completedMiddlePieces.GetCardinality())) * torrentUsualPieceSize
 	return
 }
 
 func (f *File) bytesLeft() (left int64) {
-	return fileBytesLeft(int64(f.t.usualPieceSize()), f.firstPieceIndex(), f.endPieceIndex(), f.offset, f.length, f.t._completedPieces)
+	return fileBytesLeft(
+		int64(f.t.usualPieceSize()),
+		f.BeginPieceIndex(),
+		f.EndPieceIndex(),
+		f.offset,
+		f.length,
+		&f.t._completedPieces.Bitmap,
+		func(pieceIndex int) int64 {
+			return int64(f.t.piece(pieceIndex).numDirtyBytes())
+		},
+	)
 }
 
 // The relative file path for a multi-file torrent, and the torrent name for a
-// single-file torrent.
+// single-file torrent. Dir separators are '/'.
 func (f *File) DisplayPath() string {
-	fip := f.FileInfo().Path
-	if len(fip) == 0 {
-		return f.t.info.Name
-	}
-	return strings.Join(fip, "/")
+	return f.displayPath
 }
 
 // The download status of a piece that comprises part of a File.
@@ -144,47 +185,58 @@ func (f *File) Cancel() {
 }
 
 func (f *File) NewReader() Reader {
-	tr := reader{
-		mu:        f.t.cl.locker(),
-		t:         f.t,
-		readahead: 5 * 1024 * 1024,
-		offset:    f.Offset(),
-		length:    f.Length(),
-	}
-	f.t.addReader(&tr)
-	return &tr
+	return f.t.newReader(f.Offset(), f.Length())
 }
 
 // Sets the minimum priority for pieces in the File.
-func (f *File) SetPriority(prio piecePriority) {
+func (f *File) SetPriority(prio PiecePriority) {
 	f.t.cl.lock()
-	defer f.t.cl.unlock()
-	if prio == f.prio {
-		return
+	if prio != f.prio {
+		f.prio = prio
+		f.t.updatePiecePriorities(f.BeginPieceIndex(), f.EndPieceIndex(), "File.SetPriority")
 	}
-	f.prio = prio
-	f.t.updatePiecePriorities(f.firstPieceIndex(), f.endPieceIndex())
+	f.t.cl.unlock()
 }
 
 // Returns the priority per File.SetPriority.
-func (f *File) Priority() piecePriority {
-	f.t.cl.lock()
-	defer f.t.cl.unlock()
-	return f.prio
+func (f *File) Priority() (prio PiecePriority) {
+	f.t.cl.rLock()
+	prio = f.prio
+	f.t.cl.rUnlock()
+	return
 }
 
 // Returns the index of the first piece containing data for the file.
-func (f *File) firstPieceIndex() pieceIndex {
-	if f.t.usualPieceSize() == 0 {
-		return 0
-	}
-	return pieceIndex(f.offset / int64(f.t.usualPieceSize()))
+func (f *File) BeginPieceIndex() int {
+	return f.fi.BeginPieceIndex(int64(f.t.usualPieceSize()))
 }
 
 // Returns the index of the piece after the last one containing data for the file.
-func (f *File) endPieceIndex() pieceIndex {
-	if f.t.usualPieceSize() == 0 {
-		return 0
+func (f *File) EndPieceIndex() int {
+	return f.fi.EndPieceIndex(int64(f.t.usualPieceSize()))
+}
+
+func (f *File) numPieces() int {
+	return f.EndPieceIndex() - f.BeginPieceIndex()
+}
+
+func (f *File) PieceIndices() iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := f.BeginPieceIndex(); i < f.EndPieceIndex(); i++ {
+			if !yield(i) {
+				break
+			}
+		}
 	}
-	return pieceIndex((f.offset + f.length + int64(f.t.usualPieceSize()) - 1) / int64(f.t.usualPieceSize()))
+}
+
+func (f *File) Pieces() iter.Seq[Piece] {
+	return func(yield func(Piece) bool) {
+		for i := range f.PieceIndices() {
+			p := f.t.piece(i)
+			if !yield(p) {
+				break
+			}
+		}
+	}
 }

@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -9,20 +10,18 @@ import (
 	"testing/iotest"
 
 	"github.com/anacrolix/log"
-	pp "github.com/anacrolix/torrent/peer_protocol"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	qt "github.com/go-quicktest/qt"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/internal/testutil"
 	"github.com/anacrolix/torrent/metainfo"
+	pp "github.com/anacrolix/torrent/peer_protocol"
 	"github.com/anacrolix/torrent/storage"
 )
 
 func justOneNetwork(cc *torrent.ClientConfig) {
 	cc.DisableTCP = true
-	cc.DisableIPv4 = true
+	cc.DisableIPv6 = true
 }
 
 func TestReceiveChunkStorageFailureSeederFastExtensionDisabled(t *testing.T) {
@@ -36,7 +35,7 @@ func TestReceiveChunkStorageFailure(t *testing.T) {
 func testReceiveChunkStorageFailure(t *testing.T, seederFast bool) {
 	seederDataDir, metainfo := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(seederDataDir)
-	seederClientConfig := torrent.TestingConfig()
+	seederClientConfig := torrent.TestingConfig(t)
 	seederClientConfig.Debug = true
 	justOneNetwork(seederClientConfig)
 	seederClientStorage := storage.NewMMap(seederDataDir)
@@ -46,32 +45,34 @@ func testReceiveChunkStorageFailure(t *testing.T, seederFast bool) {
 	seederClientConfig.Debug = true
 	seederClientConfig.Extensions.SetBit(pp.ExtensionBitFast, seederFast)
 	seederClient, err := torrent.NewClient(seederClientConfig)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer seederClient.Close()
 	defer testutil.ExportStatusWriter(seederClient, "s", t)()
-	leecherClientConfig := torrent.TestingConfig()
+	leecherClientConfig := torrent.TestingConfig(t)
 	leecherClientConfig.Debug = true
+	// Don't require fast extension, whether the seeder will provide it or not (so we can test mixed
+	// cases).
+	leecherClientConfig.MinPeerExtensions.SetBit(pp.ExtensionBitFast, false)
 	justOneNetwork(leecherClientConfig)
 	leecherClient, err := torrent.NewClient(leecherClientConfig)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer leecherClient.Close()
 	defer testutil.ExportStatusWriter(leecherClient, "l", t)()
 	info, err := metainfo.UnmarshalInfo()
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	leecherStorage := diskFullStorage{
 		pieces: make([]pieceState, info.NumPieces()),
 		data:   make([]byte, info.TotalLength()),
 	}
 	defer leecherStorage.Close()
-	leecherTorrent, new, err := leecherClient.AddTorrentSpec(&torrent.TorrentSpec{
+	leecherTorrent, new := leecherClient.AddTorrentOpt(torrent.AddTorrentOpts{
 		InfoHash: metainfo.HashInfoBytes(),
 		Storage:  &leecherStorage,
 	})
 	leecherStorage.t = leecherTorrent
-	require.NoError(t, err)
-	assert.True(t, new)
+	qt.Check(t, qt.IsTrue(new))
 	seederTorrent, err := seederClient.AddTorrent(metainfo)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	// Tell the seeder to find the leecher. Is it guaranteed seeders will always try to do this?
 	seederTorrent.AddClientPeer(leecherClient)
 	<-leecherTorrent.GotInfo()
@@ -95,7 +96,7 @@ func testReceiveChunkStorageFailure(t *testing.T, seederFast bool) {
 		}
 	}
 	// TODO: Check that PeerConns fastEnabled matches seederFast?
-	//select {}
+	// select {}
 }
 
 type pieceState struct {
@@ -123,8 +124,12 @@ func (me *diskFullStorage) Close() error {
 	return nil
 }
 
-func (d *diskFullStorage) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
-	return d, nil
+func (d *diskFullStorage) OpenTorrent(
+	_ context.Context,
+	info *metainfo.Info,
+	infoHash metainfo.Hash,
+) (storage.TorrentImpl, error) {
+	return storage.TorrentImpl{Piece: d.Piece, Close: d.Close}, nil
 }
 
 type pieceImpl struct {
@@ -170,7 +175,8 @@ func (me pieceImpl) MarkComplete() error {
 }
 
 func (me pieceImpl) MarkNotComplete() error {
-	panic("implement me")
+	me.state().complete = false
+	return nil
 }
 
 func (me pieceImpl) Completion() storage.Completion {

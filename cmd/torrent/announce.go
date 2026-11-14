@@ -7,20 +7,31 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/tracker"
+	"github.com/anacrolix/torrent/tracker/udp"
+	"github.com/anacrolix/torrent/types/infohash"
 )
 
 type AnnounceCmd struct {
-	Tracker  string `arg:"positional"`
-	InfoHash torrent.InfoHash
+	Event    udp.AnnounceEvent
+	Port     *uint16
+	Tracker  string     `arg:"positional"`
+	InfoHash infohash.T `arg:"positional"`
 }
 
-func announceErr() error {
+func announceErr(flags AnnounceCmd) error {
+	req := tracker.AnnounceRequest{
+		InfoHash: flags.InfoHash,
+		Port:     uint16(torrent.NewDefaultClientConfig().ListenPort),
+		NumWant:  -1,
+		Event:    flags.Event,
+		Left:     -1,
+	}
+	if flags.Port != nil {
+		req.Port = *flags.Port
+	}
 	response, err := tracker.Announce{
 		TrackerUrl: flags.Tracker,
-		Request: tracker.AnnounceRequest{
-			InfoHash: flags.InfoHash,
-			Port:     uint16(torrent.NewDefaultClientConfig().ListenPort),
-		},
+		Request:    req,
 	}.Do()
 	if err != nil {
 		return fmt.Errorf("doing announce: %w", err)

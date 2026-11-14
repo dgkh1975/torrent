@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -8,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/alexflint/go-arg"
-	"golang.org/x/xerrors"
 
 	"github.com/anacrolix/torrent/mse"
 )
@@ -21,7 +22,7 @@ func main() {
 }
 
 func mainErr() error {
-	var args = struct {
+	args := struct {
 		CryptoMethod mse.CryptoMethod
 		Dial         *struct {
 			Network        string `arg:"positional"`
@@ -41,28 +42,28 @@ func mainErr() error {
 	if args.Dial != nil {
 		cn, err := net.Dial(args.Dial.Network, args.Dial.Address)
 		if err != nil {
-			return xerrors.Errorf("dialing: %w", err)
+			return fmt.Errorf("dialing: %w", err)
 		}
 		defer cn.Close()
 		rw, _, err := mse.InitiateHandshake(cn, []byte(args.Dial.SecretKey), args.Dial.InitialPayload, args.CryptoMethod)
 		if err != nil {
-			return xerrors.Errorf("initiating handshake: %w", err)
+			return fmt.Errorf("initiating handshake: %w", err)
 		}
 		doStreaming(rw)
 	}
 	if args.Listen != nil {
 		l, err := net.Listen(args.Listen.Network, args.Listen.Address)
 		if err != nil {
-			return xerrors.Errorf("listening: %w", err)
+			return fmt.Errorf("listening: %w", err)
 		}
 		defer l.Close()
 		cn, err := l.Accept()
 		l.Close()
 		if err != nil {
-			return xerrors.Errorf("accepting: %w", err)
+			return fmt.Errorf("accepting: %w", err)
 		}
 		defer cn.Close()
-		rw, _, err := mse.ReceiveHandshake(cn, func(f func([]byte) bool) {
+		rw, _, err := mse.ReceiveHandshake(context.TODO(), cn, func(f func([]byte) bool) {
 			for _, sk := range args.Listen.SecretKeys {
 				f([]byte(sk))
 			}

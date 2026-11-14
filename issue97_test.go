@@ -1,29 +1,22 @@
 package torrent
 
 import (
-	"io/ioutil"
-	"os"
 	"testing"
 
-	"github.com/anacrolix/log"
-	"github.com/stretchr/testify/require"
+	qt "github.com/go-quicktest/qt"
 
 	"github.com/anacrolix/torrent/internal/testutil"
 	"github.com/anacrolix/torrent/storage"
 )
 
 func TestHashPieceAfterStorageClosed(t *testing.T) {
-	td, err := ioutil.TempDir("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(td)
-	tt := &Torrent{
-		storageOpener: storage.NewClient(storage.NewFile(td)),
-		logger:        log.Default,
-	}
+	cl := newTestingClient(t)
+	td := t.TempDir()
+	cs := storage.NewFile(td)
+	defer cs.Close()
 	mi := testutil.GreetingMetaInfo()
-	info, err := mi.UnmarshalInfo()
-	require.NoError(t, err)
-	require.NoError(t, tt.setInfo(&info))
-	require.NoError(t, tt.storage.Close())
-	tt.hashPiece(0)
+	tt := cl.newTorrent(mi.HashInfoBytes(), cs)
+	qt.Assert(t, qt.IsNil(tt.SetInfoBytes(mi.InfoBytes)))
+	go tt.piece(0).VerifyDataContext(t.Context())
+	qt.Assert(t, qt.IsNil(tt.storage.Close()))
 }

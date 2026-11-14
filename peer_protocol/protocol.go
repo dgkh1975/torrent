@@ -1,15 +1,29 @@
 package peer_protocol
 
+import (
+	"unsafe"
+)
+
 const (
 	Protocol = "\x13BitTorrent protocol"
 )
 
+func protocolBytes() []byte {
+	return unsafe.Slice(unsafe.StringData(Protocol), len(Protocol))
+}
+
 type MessageType byte
 
+// golang.org/x/tools/cmd/stringer
 //go:generate stringer -type=MessageType
 
 func (mt MessageType) FastExtension() bool {
 	return mt >= Suggest && mt <= AllowedFast
+}
+
+func (mt *MessageType) UnmarshalBinary(b []byte) error {
+	*mt = MessageType(b[0])
+	return nil
 }
 
 const (
@@ -36,12 +50,17 @@ const (
 
 	// BEP 10
 	Extended MessageType = 20
+
+	// BEP 52
+	HashRequest MessageType = 21
+	Hashes      MessageType = 22
+	HashReject  MessageType = 23
 )
 
 const (
 	HandshakeExtendedID = 0
 
-	RequestMetadataExtensionMsgType = 0
-	DataMetadataExtensionMsgType    = 1
-	RejectMetadataExtensionMsgType  = 2
+	RequestMetadataExtensionMsgType ExtendedMetadataRequestMsgType = 0
+	DataMetadataExtensionMsgType    ExtendedMetadataRequestMsgType = 1
+	RejectMetadataExtensionMsgType  ExtendedMetadataRequestMsgType = 2
 )

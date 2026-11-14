@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -8,10 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/anacrolix/missinggo"
-	"github.com/bradfitz/iter"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	g "github.com/anacrolix/generics"
+	"github.com/anacrolix/missinggo/v2"
+	"github.com/go-quicktest/qt"
 
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/internal/testutil"
@@ -67,8 +67,10 @@ func TestAppendToCopySlice(t *testing.T) {
 
 func TestTorrentString(t *testing.T) {
 	tor := &Torrent{}
+	tor.infoHash.Ok = true
+	tor.infoHash.Value[0] = 1
 	s := tor.InfoHash().HexString()
-	if s != "0000000000000000000000000000000000000000" {
+	if s != "0100000000000000000000000000000000000000" {
 		t.FailNow()
 	}
 }
@@ -81,27 +83,28 @@ func BenchmarkUpdatePiecePriorities(b *testing.B) {
 		numPieces   = 13410
 		pieceLength = 256 << 10
 	)
-	cl := &Client{config: TestingConfig()}
-	cl.initLogger()
-	t := cl.newTorrent(metainfo.Hash{}, nil)
-	require.NoError(b, t.setInfo(&metainfo.Info{
+	cl := newTestingClient(b)
+	t := cl.newTorrentForTesting()
+	qt.Assert(b, qt.IsNil(t.setInfoUnlocked(&metainfo.Info{
 		Pieces:      make([]byte, metainfo.HashSize*numPieces),
 		PieceLength: pieceLength,
 		Length:      pieceLength * numPieces,
-	}))
-	assert.EqualValues(b, 13410, t.numPieces())
-	for range iter.N(7) {
+	})))
+	qt.Check(b, qt.Equals(t.numPieces(), 13410))
+	for i := 0; i < 7; i += 1 {
 		r := t.NewReader()
 		r.SetReadahead(32 << 20)
 		r.Seek(3500000, io.SeekStart)
 	}
-	assert.Len(b, t.readers, 7)
-	for i := 0; i < int(t.numPieces()); i += 3 {
-		t._completedPieces.Set(i, true)
+	qt.Check(b, qt.HasLen(t.readers, 7))
+	for i := 0; i < t.numPieces(); i += 3 {
+		t._completedPieces.Add(i)
 	}
 	t.DownloadPieces(0, t.numPieces())
-	for range iter.N(b.N) {
-		t.updateAllPiecePriorities()
+	for b.Loop() {
+		cl.lock()
+		t.updateAllPiecePriorities("")
+		cl.unlock()
 	}
 }
 
@@ -110,38 +113,31 @@ func BenchmarkUpdatePiecePriorities(b *testing.B) {
 // file-based on the native filesystem based.
 func testEmptyFilesAndZeroPieceLength(t *testing.T, cfg *ClientConfig) {
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	ib, err := bencode.Marshal(metainfo.Info{
 		Name:        "empty",
 		Length:      0,
 		PieceLength: 0,
 	})
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	fp := filepath.Join(cfg.DataDir, "empty")
 	os.Remove(fp)
-	assert.False(t, missinggo.FilePathExists(fp))
+	qt.Check(t, qt.IsFalse(missinggo.FilePathExists(fp)))
 	tt, err := cl.AddTorrent(&metainfo.MetaInfo{
 		InfoBytes: ib,
 	})
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer tt.Drop()
 	tt.DownloadAll()
-	require.True(t, cl.WaitAll())
-	assert.True(t, missinggo.FilePathExists(fp))
+	qt.Assert(t, qt.IsTrue(cl.WaitAll()))
+	qt.Check(t, qt.IsTrue(tt.Complete().Bool()))
+	qt.Check(t, qt.IsTrue(missinggo.FilePathExists(fp)))
 }
 
 func TestEmptyFilesAndZeroPieceLengthWithFileStorage(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	ci := storage.NewFile(cfg.DataDir)
-	defer ci.Close()
-	cfg.DefaultStorage = ci
-	testEmptyFilesAndZeroPieceLength(t, cfg)
-}
-
-func TestEmptyFilesAndZeroPieceLengthWithMMapStorage(t *testing.T) {
-	cfg := TestingConfig()
-	ci := storage.NewMMap(cfg.DataDir)
 	defer ci.Close()
 	cfg.DefaultStorage = ci
 	testEmptyFilesAndZeroPieceLength(t, cfg)
@@ -149,49 +145,53 @@ func TestEmptyFilesAndZeroPieceLengthWithMMapStorage(t *testing.T) {
 
 func TestPieceHashFailed(t *testing.T) {
 	mi := testutil.GreetingMetaInfo()
-	cl := new(Client)
-	cl.config = TestingConfig()
-	cl.initLogger()
+	cl := newTestingClient(t)
 	tt := cl.newTorrent(mi.HashInfoBytes(), badStorage{})
 	tt.setChunkSize(2)
-	require.NoError(t, tt.setInfoBytes(mi.InfoBytes))
 	tt.cl.lock()
-	tt.pieces[1]._dirtyChunks.AddRange(0, 3)
-	require.True(t, tt.pieceAllDirty(1))
+	qt.Assert(t, qt.IsNil(tt.setInfoBytesLocked(mi.InfoBytes, nil)))
+	tt.cl.unlock()
+	tt.cl.lock()
+	tt.dirtyChunks.AddRange(
+		uint64(tt.pieceRequestIndexBegin(1)),
+		uint64(tt.pieceRequestIndexBegin(1)+3))
+	qt.Assert(t, qt.IsTrue(tt.pieceAllDirty(1)))
 	tt.pieceHashed(1, false, nil)
 	// Dirty chunks should be cleared so we can try again.
-	require.False(t, tt.pieceAllDirty(1))
+	qt.Assert(t, qt.IsFalse(tt.pieceAllDirty(1)))
 	tt.cl.unlock()
 }
 
 // Check the behaviour of Torrent.Metainfo when metadata is not completed.
 func TestTorrentMetainfoIncompleteMetadata(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.Debug = true
+	// Disable this just because we manually initiate a connection without it.
+	cfg.MinPeerExtensions.SetBit(pp.ExtensionBitFast, false)
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 
 	mi := testutil.GreetingMetaInfo()
 	ih := mi.HashInfoBytes()
 
 	tt, _ := cl.AddTorrentInfoHash(ih)
-	assert.Nil(t, tt.Metainfo().InfoBytes)
-	assert.False(t, tt.haveAllMetadataPieces())
+	qt.Check(t, qt.IsNil(tt.Metainfo().InfoBytes))
+	qt.Check(t, qt.IsFalse(tt.haveAllMetadataPieces()))
 
 	nc, err := net.Dial("tcp", fmt.Sprintf(":%d", cl.LocalPort()))
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer nc.Close()
 
 	var pex PeerExtensionBits
-	pex.SetBit(pp.ExtensionBitExtended, true)
-	hr, err := pp.Handshake(nc, &ih, [20]byte{}, pex)
-	require.NoError(t, err)
-	assert.True(t, hr.PeerExtensionBits.GetBit(pp.ExtensionBitExtended))
-	assert.EqualValues(t, cl.PeerID(), hr.PeerID)
-	assert.EqualValues(t, ih, hr.Hash)
+	pex.SetBit(pp.ExtensionBitLtep, true)
+	hr, err := pp.Handshake(context.Background(), nc, &ih, [20]byte{}, pex)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.IsTrue(hr.PeerExtensionBits.GetBit(pp.ExtensionBitLtep)))
+	qt.Check(t, qt.Equals(hr.PeerID, cl.PeerID()))
+	qt.Check(t, qt.Equals(hr.Hash, ih))
 
-	assert.EqualValues(t, 0, tt.metadataSize())
+	qt.Check(t, qt.Equals(tt.metadataSize(), 0))
 
 	func() {
 		cl.lock()
@@ -211,11 +211,108 @@ func TestTorrentMetainfoIncompleteMetadata(t *testing.T) {
 					return b
 				}(),
 			}.MustMarshalBinary())
-			require.NoError(t, err)
+			qt.Assert(t, qt.IsNil(err))
 		}()
 		tt.metadataChanged.Wait()
 	}()
-	assert.Equal(t, make([]byte, len(mi.InfoBytes)), tt.metadataBytes)
-	assert.False(t, tt.haveAllMetadataPieces())
-	assert.Nil(t, tt.Metainfo().InfoBytes)
+	qt.Check(t, qt.DeepEquals(tt.metadataBytes, make([]byte, len(mi.InfoBytes))))
+	qt.Check(t, qt.IsFalse(tt.haveAllMetadataPieces()))
+	qt.Check(t, qt.IsNil(tt.Metainfo().InfoBytes))
+}
+
+func TestRelativeAvailabilityHaveNone(t *testing.T) {
+	var err error
+	cl := newTestingClient(t)
+	mi, _ := testutil.Greeting.Generate(5)
+	tt := cl.newTorrentOpt(AddTorrentOpts{InfoHash: mi.HashInfoBytes()})
+	tt.setChunkSize(2)
+	g.MakeMapIfNil(&tt.conns)
+	pc := PeerConn{}
+	pc.t = tt
+	pc.legacyPeerImpl = &pc
+	pc.initRequestState()
+	g.InitNew(&pc.callbacks)
+	tt.cl.lock()
+	tt.conns[&pc] = struct{}{}
+	err = pc.peerSentHave(0)
+	tt.cl.unlock()
+	qt.Assert(t, qt.IsNil(err))
+	err = tt.SetInfoBytes(mi.InfoBytes)
+	qt.Assert(t, qt.IsNil(err))
+	tt.cl.lock()
+	err = pc.peerSentHaveNone()
+	tt.cl.unlock()
+	qt.Assert(t, qt.IsNil(err))
+	tt.Drop()
+	tt.assertAllPiecesRelativeAvailabilityZero()
+}
+
+// A peer can go from having all pieces, to none, to some. Its availability must still be fully
+// removed when the conn goes away.
+func TestRelativeAvailabilityHaveAllHaveNoneHave(t *testing.T) {
+	cl := newTestingClient(t)
+	mi, _ := testutil.Greeting.Generate(5)
+	tt := cl.newTorrentOpt(AddTorrentOpts{InfoHash: mi.HashInfoBytes()})
+	tt.setChunkSize(2)
+	g.MakeMapIfNil(&tt.conns)
+	qt.Assert(t, qt.IsNil(tt.SetInfoBytes(mi.InfoBytes)))
+	pc := PeerConn{}
+	pc.t = tt
+	pc.legacyPeerImpl = &pc
+	pc.initRequestState()
+	g.InitNew(&pc.callbacks)
+	tt.cl.lock()
+	tt.conns[&pc] = struct{}{}
+	qt.Assert(t, qt.IsNil(pc.onPeerSentHaveAll()))
+	qt.Assert(t, qt.IsNil(pc.peerSentHaveNone()))
+	qt.Check(t, qt.HasLen(tt.connsWithAllPieces, 0))
+	qt.Assert(t, qt.IsNil(pc.peerSentHave(0)))
+	qt.Check(t, qt.Equals(tt.piece(0).availability(), 1))
+	qt.Check(t, qt.Equals(tt.piece(1).availability(), 0))
+	tt.cl.unlock()
+	// Dropping asserts all relative availability returns to zero.
+	tt.Drop()
+}
+
+func TestAppendMissingStringsSkipsRepeats(t *testing.T) {
+	qt.Check(t, qt.DeepEquals(
+		appendMissingStrings(
+			[]string{"http://existing"},
+			[]string{"http://a", "http://b", "http://a", "http://existing"}),
+		[]string{"http://existing", "http://a", "http://b"}))
+}
+
+// A torrent with many leading empty files before a data file: a valid shape (empty files are
+// common as padding/placeholders) that made makePieces rescan the empty files for every piece.
+func benchmarkMakePiecesInfo(n int) *metainfo.Info {
+	const pieceLength = 1 << 14
+	files := make([]metainfo.FileInfo, 0, n+1)
+	for i := 0; i < n; i++ {
+		files = append(files, metainfo.FileInfo{Length: 0, Path: []string{"pad", fmt.Sprintf("%d", i)}})
+	}
+	files = append(files, metainfo.FileInfo{Length: int64(n) * pieceLength, Path: []string{"data"}})
+	return &metainfo.Info{
+		Name:        "x",
+		PieceLength: pieceLength,
+		Pieces:      make([]byte, 20*n),
+		Files:       files,
+	}
+}
+
+func BenchmarkMakePieces(b *testing.B) {
+	cl, err := NewClient(TestingConfig(b))
+	qt.Assert(b, qt.IsNil(err))
+	defer cl.Close()
+	info := benchmarkMakePiecesInfo(20000)
+	tt := cl.newTorrentForTesting()
+	cl.lock()
+	defer cl.unlock()
+	tt.info = info
+	tt.fileSegmentsIndex.Set(info.FileSegmentsIndex())
+	tt.initFiles()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tt.makePieces()
+	}
 }

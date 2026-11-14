@@ -1,22 +1,14 @@
 package segments
 
 import (
+	"slices"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/go-quicktest/qt"
 )
 
 func LengthIterFromSlice(ls []Length) LengthIter {
-	return func() (Length, bool) {
-		switch len(ls) {
-		case 0:
-			return -1, false
-		default:
-			l := ls[0]
-			ls = ls[1:]
-			return l, true
-		}
-	}
+	return slices.Values(ls)
 }
 
 type ScanCallbackValue struct {
@@ -36,28 +28,35 @@ func (me *collectExtents) scanCallback(i int, e Extent) bool {
 
 type newLocater func(LengthIter) Locater
 
-func assertLocate(t *testing.T, nl newLocater, ls []Length, needle Extent, firstExpectedIndex int, expectedExtents []Extent) {
+func checkContiguous(
+	t *testing.T,
+	nl newLocater,
+	ls []Length,
+	needle Extent,
+	firstExpectedIndex int,
+	expectedExtents []Extent,
+) {
 	var actual collectExtents
 	var expected collectExtents
 	for i, e := range expectedExtents {
 		expected.scanCallback(firstExpectedIndex+i, e)
 	}
 	nl(LengthIterFromSlice(ls))(needle, actual.scanCallback)
-	assert.EqualValues(t, expected, actual)
+	qt.Check(t, qt.DeepEquals(actual, expected))
 }
 
 func testLocater(t *testing.T, newLocater newLocater) {
-	assertLocate(t, newLocater,
+	checkContiguous(t, newLocater,
 		[]Length{1, 0, 2, 0, 3},
 		Extent{2, 2},
 		2,
 		[]Extent{{1, 1}, {0, 0}, {0, 1}})
-	assertLocate(t, newLocater,
+	checkContiguous(t, newLocater,
 		[]Length{1, 0, 2, 0, 3},
 		Extent{6, 2},
 		2,
 		[]Extent{})
-	assertLocate(t, newLocater,
+	checkContiguous(t, newLocater,
 		[]Length{1652, 1514, 1554, 1618, 1546, 129241752, 1537}, // 128737588
 		Extent{0, 16384},
 		0,
@@ -67,8 +66,9 @@ func testLocater(t *testing.T, newLocater newLocater) {
 			{0, 1554},
 			{0, 1618},
 			{0, 1546},
-			{0, 8500}})
-	assertLocate(t, newLocater,
+			{0, 8500},
+		})
+	checkContiguous(t, newLocater,
 		[]Length{1652, 1514, 1554, 1618, 1546, 129241752, 1537, 1536, 1551}, // 128737588
 		Extent{129236992, 16384},
 		5,
@@ -76,15 +76,65 @@ func testLocater(t *testing.T, newLocater newLocater) {
 			{129229108, 12644},
 			{0, 1537},
 			{0, 1536},
-			{0, 667}})
+			{0, 667},
+		})
+	checkContiguous(t, newLocater,
+		[]Length{0, 2, 0, 2, 0}, // 128737588
+		Extent{1, 2},
+		1,
+		[]Extent{
+			{1, 1},
+			{0, 0},
+			{0, 1},
+		})
+	checkContiguous(t, newLocater,
+		[]Length{2, 0, 2, 0}, // 128737588
+		Extent{1, 3},
+		0,
+		[]Extent{
+			{1, 1},
+			{0, 0},
+			{0, 2},
+		})
+	checkContiguous(t, newLocater,
+		[]Length{2, 0, 1, 0, 0, 1},
+		Extent{3, 2},
+		5,
+		[]Extent{
+			{0, 1},
+		})
+	checkContiguous(t, newLocater,
+		[]Length{2, 0, 1, 0, 0, 1},
+		Extent{2, 2},
+		2,
+		[]Extent{
+			{0, 1},
+			{0, 0},
+			{0, 0},
+			{0, 1},
+		})
+	checkContiguous(t, newLocater,
+		[]Length{},
+		Extent{1, 1},
+		0,
+		[]Extent{})
+	checkContiguous(t, newLocater,
+		[]Length{0},
+		Extent{1, 1},
+		0,
+		[]Extent{})
 }
 
-func TestScan(t *testing.T) {
-	testLocater(t, LocaterFromLengthIter)
-}
-
-func TestIndex(t *testing.T) {
+func TestIndexLocateIter(t *testing.T) {
 	testLocater(t, func(li LengthIter) Locater {
-		return NewIndex(li).Locate
+		index := NewIndex(li)
+		return func(extent Extent, callback Callback) bool {
+			for i, e := range index.LocateIter(extent) {
+				if !callback(i, e) {
+					return false
+				}
+			}
+			return true
+		}
 	})
 }

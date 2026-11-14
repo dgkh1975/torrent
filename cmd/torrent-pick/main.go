@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -78,7 +77,7 @@ func dstFileName(picked string) string {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	var rootGroup = struct {
+	rootGroup := struct {
 		Client    *torrent.ClientConfig `group:"Client Options"`
 		TestPeers []string              `long:"test-peer" description:"address of peer to inject to every torrent"`
 		Pick      string                `long:"pick" description:"filename to pick"`
@@ -107,7 +106,7 @@ func main() {
 		return
 	}
 
-	tmpdir, err := ioutil.TempDir("", "torrent-pick-")
+	tmpdir, err := os.MkdirTemp("", "torrent-pick-")
 	if err != nil {
 		log.Fatal(err)
 	}

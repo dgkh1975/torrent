@@ -6,7 +6,6 @@
 package testutil
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -34,14 +33,15 @@ func CreateDummyTorrentData(dirName string) string {
 }
 
 func GreetingMetaInfo() *metainfo.MetaInfo {
-	return Greeting.Metainfo(5)
+	mi, _ := Greeting.Generate(5)
+	return &mi
 }
 
 // Gives a temporary directory containing the completed "greeting" torrent,
 // and a corresponding metainfo describing it. The temporary directory can be
 // cleaned away with os.RemoveAll.
 func GreetingTestTorrent() (tempDir string, metaInfo *metainfo.MetaInfo) {
-	tempDir, err := ioutil.TempDir(os.TempDir(), "")
+	tempDir, err := os.MkdirTemp(os.TempDir(), "")
 	if err != nil {
 		panic(err)
 	}

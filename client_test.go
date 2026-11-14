@@ -1,10 +1,16 @@
 package torrent
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
+	rand "math/rand/v2"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,16 +18,14 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/bradfitz/iter"
-	"github.com/frankban/quicktest"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
 	"github.com/anacrolix/dht/v2"
-	"github.com/anacrolix/missinggo"
+	"github.com/anacrolix/log"
+	"github.com/anacrolix/missinggo/v2"
 	"github.com/anacrolix/missinggo/v2/filecache"
+	"github.com/go-quicktest/qt"
 
 	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/dialer"
 	"github.com/anacrolix/torrent/internal/testutil"
 	"github.com/anacrolix/torrent/iplist"
 	"github.com/anacrolix/torrent/metainfo"
@@ -29,42 +33,41 @@ import (
 )
 
 func TestClientDefault(t *testing.T) {
-	cl, err := NewClient(TestingConfig())
-	require.NoError(t, err)
-	cl.Close()
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.HasLen(cl.Close(), 0))
+}
+
+func TestClientWithSocks5Dialer(t *testing.T) {
+	// Use the testing config so we listen on an ephemeral port. The default port (42069) falls in
+	// Linux's ephemeral range, so it can collide with sockets from tests running concurrently.
+	cfg := TestingConfig(t)
+	cfg.DialForPeerConns = false
+	cl, err := NewClient(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	defer cl.Close()
+	cl.AddDialer(dialer.NewSocks5("127.0.0.1:1080", nil))
 }
 
 func TestClientNilConfig(t *testing.T) {
+	// The default config will put crap in the working directory.
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	os.Chdir(t.TempDir())
 	cl, err := NewClient(nil)
-	require.NoError(t, err)
-	cl.Close()
-}
-
-func TestBoltPieceCompletionClosedWhenClientClosed(t *testing.T) {
-	cfg := TestingConfig()
-	pc, err := storage.NewBoltPieceCompletion(cfg.DataDir)
-	require.NoError(t, err)
-	ci := storage.NewFileWithCompletion(cfg.DataDir, pc)
-	defer ci.Close()
-	cfg.DefaultStorage = ci
-	cl, err := NewClient(cfg)
-	require.NoError(t, err)
-	cl.Close()
-	// And again, https://github.com/anacrolix/torrent/issues/158
-	cl, err = NewClient(cfg)
-	require.NoError(t, err)
-	cl.Close()
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.HasLen(cl.Close(), 0))
 }
 
 func TestAddDropTorrent(t *testing.T) {
-	cl, err := NewClient(TestingConfig())
-	require.NoError(t, err)
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	dir, mi := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(dir)
 	tt, new, err := cl.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
-	require.NoError(t, err)
-	assert.True(t, new)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.IsTrue(new))
 	tt.SetMaxEstablishedConns(0)
 	tt.SetMaxEstablishedConns(1)
 	tt.Drop()
@@ -86,31 +89,36 @@ func TestAddPeersToUnknownTorrent(t *testing.T) {
 }
 
 func TestPieceHashSize(t *testing.T) {
-	assert.Equal(t, 20, pieceHash.Size())
+	qt.Check(t, qt.Equals(pieceHash.Size(), 20))
 }
 
 func TestTorrentInitialState(t *testing.T) {
 	dir, mi := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(dir)
-	cl := &Client{
-		config: TestingConfig(),
-	}
-	cl.initLogger()
+	var cl Client
+	cfg := TestingConfig(t)
+	cfg.DefaultStorage = storage.NewFileWithCompletion(cfg.DataDir, storage.NewMapPieceCompletion())
+	cl.init(cfg)
+	t.Cleanup(func() {
+		for _, f := range cl.onClose {
+			f()
+		}
+	})
 	tor := cl.newTorrent(
 		mi.HashInfoBytes(),
-		storage.NewFileWithCompletion(TestingTempDir.NewSub(), storage.NewMapPieceCompletion()),
+		storage.NewFileWithCompletion(t.TempDir(), storage.NewMapPieceCompletion()),
 	)
 	tor.setChunkSize(2)
 	tor.cl.lock()
-	err := tor.setInfoBytes(mi.InfoBytes)
+	err := tor.setInfoBytesLocked(mi.InfoBytes, nil)
 	tor.cl.unlock()
-	require.NoError(t, err)
-	require.Len(t, tor.pieces, 3)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.HasLen(tor.pieces, 3))
 	tor.pendAllChunkSpecs(0)
 	tor.cl.lock()
-	assert.EqualValues(t, 3, tor.pieceNumPendingChunks(0))
+	qt.Check(t, qt.Equals(tor.pieceNumPendingChunks(0), 3))
 	tor.cl.unlock()
-	assert.EqualValues(t, ChunkSpec{4, 1}, chunkIndexSpec(2, tor.pieceLength(0), tor.chunkSize))
+	qt.Check(t, qt.Equals(chunkIndexSpec(2, tor.pieceLength(0), tor.chunkSize), ChunkSpec{4, 1}))
 }
 
 func TestReducedDialTimeout(t *testing.T) {
@@ -140,15 +148,14 @@ func TestReducedDialTimeout(t *testing.T) {
 }
 
 func TestAddDropManyTorrents(t *testing.T) {
-	cl, err := NewClient(TestingConfig())
-	require.NoError(t, err)
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
-	for i := range iter.N(1000) {
-		var spec TorrentSpec
-		binary.PutVarint(spec.InfoHash[:], int64(i))
-		tt, new, err := cl.AddTorrentSpec(&spec)
-		assert.NoError(t, err)
-		assert.True(t, new)
+	for i := range 1000 {
+		var opts AddTorrentOpts
+		binary.PutVarint(opts.InfoHash[:], int64(i+1))
+		tt, new := cl.AddTorrentOpt(opts)
+		qt.Check(t, qt.IsTrue(new))
 		defer tt.Drop()
 	}
 }
@@ -163,28 +170,29 @@ func fileCachePieceResourceStorage(fc *filecache.Cache) storage.ClientImpl {
 }
 
 func TestMergingTrackersByAddingSpecs(t *testing.T) {
-	cl, err := NewClient(TestingConfig())
-	require.NoError(t, err)
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	spec := TorrentSpec{}
+	rand.NewChaCha8([32]byte{}).Read(spec.InfoHash[:])
 	T, new, _ := cl.AddTorrentSpec(&spec)
 	if !new {
 		t.FailNow()
 	}
 	spec.Trackers = [][]string{{"http://a"}, {"udp://b"}}
 	_, new, _ = cl.AddTorrentSpec(&spec)
-	assert.False(t, new)
-	assert.EqualValues(t, [][]string{{"http://a"}, {"udp://b"}}, T.metainfo.AnnounceList)
+	qt.Check(t, qt.IsFalse(new))
+	qt.Check(t, qt.DeepEquals(T.announceList, [][]string{{"http://a"}, {"udp://b"}}))
 	// Because trackers are disabled in TestingConfig.
-	assert.EqualValues(t, 0, len(T.trackerAnnouncers))
+	qt.Check(t, qt.Equals(len(T.trackerAnnouncers), 0))
 }
 
 // We read from a piece which is marked completed, but is missing data.
 func TestCompletedPieceWrongSize(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DefaultStorage = badStorage{}
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	info := metainfo.Info{
 		PieceLength: 15,
@@ -194,28 +202,41 @@ func TestCompletedPieceWrongSize(t *testing.T) {
 		},
 	}
 	b, err := bencode.Marshal(info)
-	require.NoError(t, err)
-	tt, new, err := cl.AddTorrentSpec(&TorrentSpec{
+	qt.Assert(t, qt.IsNil(err))
+	tt, new := cl.AddTorrentOpt(AddTorrentOpts{
 		InfoBytes: b,
 		InfoHash:  metainfo.HashBytes(b),
 	})
-	require.NoError(t, err)
 	defer tt.Drop()
-	assert.True(t, new)
+	qt.Check(t, qt.IsTrue(new))
 	r := tt.NewReader()
 	defer r.Close()
-	quicktest.Check(t, iotest.TestReader(r, []byte(testutil.GreetingFileContents)), quicktest.IsNil)
+	r.SetContext(t.Context())
+	qt.Check(t, qt.IsNil(iotest.TestReader(r, []byte(testutil.GreetingFileContents))))
+}
+
+// https://github.com/anacrolix/torrent/issues/1089
+func TestAddPureV2Torrent(t *testing.T) {
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
+	defer cl.Close()
+	tt, err := cl.AddTorrentFromFile("testdata/bittorrent-v2-test.torrent")
+	qt.Assert(t, qt.IsNil(err))
+	defer tt.Drop()
+	qt.Check(t, qt.IsFalse(tt.infoHash.Ok))
+	qt.Check(t, qt.IsTrue(tt.infoHashV2.Ok))
+	qt.Check(t, qt.Not(qt.DeepEquals(tt.InfoHash(), metainfo.Hash{})))
 }
 
 func BenchmarkAddLargeTorrent(b *testing.B) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(b)
 	cfg.DisableTCP = true
 	cfg.DisableUTP = true
 	cl, err := NewClient(cfg)
-	require.NoError(b, err)
+	qt.Assert(b, qt.IsNil(err))
 	defer cl.Close()
 	b.ReportAllocs()
-	for range iter.N(b.N) {
+	for i := 0; i < b.N; i += 1 {
 		t, err := cl.AddTorrentFromFile("testdata/bootstrap.dat.torrent")
 		if err != nil {
 			b.Fatal(err)
@@ -227,21 +248,19 @@ func BenchmarkAddLargeTorrent(b *testing.B) {
 func TestResponsive(t *testing.T) {
 	seederDataDir, mi := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(seederDataDir)
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.Seed = true
 	cfg.DataDir = seederDataDir
 	seeder, err := NewClient(cfg)
-	require.Nil(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer seeder.Close()
 	seederTorrent, _, _ := seeder.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
 	seederTorrent.VerifyData()
-	leecherDataDir, err := ioutil.TempDir("", "")
-	require.Nil(t, err)
-	defer os.RemoveAll(leecherDataDir)
-	cfg = TestingConfig()
+	leecherDataDir := t.TempDir()
+	cfg = TestingConfig(t)
 	cfg.DataDir = leecherDataDir
 	leecher, err := NewClient(cfg)
-	require.Nil(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer leecher.Close()
 	leecherTorrent, _, _ := leecher.AddTorrentSpec(func() (ret *TorrentSpec) {
 		ret = TorrentSpecFromMetaInfo(mi)
@@ -255,36 +274,78 @@ func TestResponsive(t *testing.T) {
 	reader.SetResponsive()
 	b := make([]byte, 2)
 	_, err = reader.Seek(3, io.SeekStart)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	_, err = io.ReadFull(reader, b)
-	assert.Nil(t, err)
-	assert.EqualValues(t, "lo", string(b))
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(string(b), "lo"))
 	_, err = reader.Seek(11, io.SeekStart)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	n, err := io.ReadFull(reader, b)
-	assert.Nil(t, err)
-	assert.EqualValues(t, 2, n)
-	assert.EqualValues(t, "d\n", string(b))
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(n, 2))
+	qt.Check(t, qt.Equals(string(b), "d\n"))
+}
+
+// TestResponsive was the first test to fail if uTP is disabled and TCP sockets dial from the
+// listening port.
+func TestResponsiveTcpOnly(t *testing.T) {
+	seederDataDir, mi := testutil.GreetingTestTorrent()
+	defer os.RemoveAll(seederDataDir)
+	cfg := TestingConfig(t)
+	cfg.DisableUTP = true
+	cfg.Seed = true
+	cfg.DataDir = seederDataDir
+	seeder, err := NewClient(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	defer seeder.Close()
+	seederTorrent, _, _ := seeder.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
+	seederTorrent.VerifyData()
+	leecherDataDir := t.TempDir()
+	cfg = TestingConfig(t)
+	cfg.DataDir = leecherDataDir
+	leecher, err := NewClient(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	defer leecher.Close()
+	leecherTorrent, _, _ := leecher.AddTorrentSpec(func() (ret *TorrentSpec) {
+		ret = TorrentSpecFromMetaInfo(mi)
+		ret.ChunkSize = 2
+		return
+	}())
+	leecherTorrent.AddClientPeer(seeder)
+	reader := leecherTorrent.NewReader()
+	defer reader.Close()
+	reader.SetReadahead(0)
+	reader.SetResponsive()
+	b := make([]byte, 2)
+	_, err = reader.Seek(3, io.SeekStart)
+	qt.Assert(t, qt.IsNil(err))
+	_, err = io.ReadFull(reader, b)
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(string(b), "lo"))
+	_, err = reader.Seek(11, io.SeekStart)
+	qt.Assert(t, qt.IsNil(err))
+	n, err := io.ReadFull(reader, b)
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(n, 2))
+	qt.Check(t, qt.Equals(string(b), "d\n"))
 }
 
 func TestTorrentDroppedDuringResponsiveRead(t *testing.T) {
 	seederDataDir, mi := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(seederDataDir)
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.Seed = true
 	cfg.DataDir = seederDataDir
 	seeder, err := NewClient(cfg)
-	require.Nil(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer seeder.Close()
 	seederTorrent, _, _ := seeder.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
 	seederTorrent.VerifyData()
-	leecherDataDir, err := ioutil.TempDir("", "")
-	require.Nil(t, err)
-	defer os.RemoveAll(leecherDataDir)
-	cfg = TestingConfig()
+	leecherDataDir := t.TempDir()
+	cfg = TestingConfig(t)
 	cfg.DataDir = leecherDataDir
 	leecher, err := NewClient(cfg)
-	require.Nil(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer leecher.Close()
 	leecherTorrent, _, _ := leecher.AddTorrentSpec(func() (ret *TorrentSpec) {
 		ret = TorrentSpecFromMetaInfo(mi)
@@ -292,72 +353,152 @@ func TestTorrentDroppedDuringResponsiveRead(t *testing.T) {
 		return
 	}())
 	leecherTorrent.AddClientPeer(seeder)
-	reader := leecherTorrent.NewReader()
-	defer reader.Close()
-	reader.SetReadahead(0)
-	reader.SetResponsive()
+	rdr := leecherTorrent.NewReader()
+	t.Cleanup(func() { rdr.Close() })
+	rdr.SetReadahead(0)
+	rdr.SetResponsive()
 	b := make([]byte, 2)
-	_, err = reader.Seek(3, io.SeekStart)
-	require.NoError(t, err)
-	_, err = io.ReadFull(reader, b)
-	assert.Nil(t, err)
-	assert.EqualValues(t, "lo", string(b))
-	go leecherTorrent.Drop()
-	_, err = reader.Seek(11, io.SeekStart)
-	require.NoError(t, err)
-	n, err := reader.Read(b)
-	assert.EqualError(t, err, "torrent closed")
-	assert.EqualValues(t, 0, n)
+	_, err = rdr.Seek(3, io.SeekStart)
+	qt.Assert(t, qt.IsNil(err))
+	_, err = io.ReadFull(rdr, b)
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(string(b), "lo"))
+	_, err = rdr.Seek(11, io.SeekStart)
+	qt.Assert(t, qt.IsNil(err))
+	leecherTorrent.Drop()
+	n, err := rdr.Read(b)
+	qt.Assert(t, qt.Equals(err, errTorrentClosed))
+	qt.Check(t, qt.Equals(n, 0))
+}
+
+func TestDropDuringVerify(t *testing.T) {
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
+	info := metainfo.Info{
+		Name:        "big.bin",
+		PieceLength: 16384,
+		Length:      1024 * 16384,
+		Pieces:      make([]byte, 1024*20),
+	}
+	b, err := bencode.Marshal(info)
+	qt.Assert(t, qt.IsNil(err))
+	tt, err := cl.AddTorrent(&metainfo.MetaInfo{InfoBytes: b})
+	qt.Assert(t, qt.IsNil(err))
+	go tt.VerifyDataContext(t.Context())
+	tt.Drop()
+	done := make(chan error, 1)
+	go func() {
+		err := tt.VerifyDataContext(t.Context())
+		cl.Close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		qt.Check(t, qt.ErrorIs(err, errTorrentClosed))
+	case <-time.After(5 * time.Second):
+		t.Fatal("client lock still held after dropping a torrent during verification")
+	}
 }
 
 func TestDhtInheritBlocklist(t *testing.T) {
 	ipl := iplist.New(nil)
-	require.NotNil(t, ipl)
-	cfg := TestingConfig()
+	qt.Assert(t, qt.IsNotNil(ipl))
+	cfg := TestingConfig(t)
 	cfg.IPBlocklist = ipl
 	cfg.NoDHT = false
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	numServers := 0
 	cl.eachDhtServer(func(s DhtServer) {
 		t.Log(s)
-		assert.Equal(t, ipl, s.(anacrolixDhtServerWrapper).Server.IPBlocklist())
+		qt.Check(t, qt.Equals(s.(AnacrolixDhtServerWrapper).Server.IPBlocklist(), iplist.Ranger(ipl)))
 		numServers++
 	})
-	assert.EqualValues(t, 2, numServers)
+	qt.Assert(t, qt.Not(qt.Equals(numServers, 0)))
 }
 
 // Check that stuff is merged in subsequent AddTorrentSpec for the same
 // infohash.
 func TestAddTorrentSpecMerging(t *testing.T) {
-	cl, err := NewClient(TestingConfig())
-	require.NoError(t, err)
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	dir, mi := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(dir)
-	tt, new, err := cl.AddTorrentSpec(&TorrentSpec{
+	tt, new := cl.AddTorrentOpt(AddTorrentOpts{
 		InfoHash: mi.HashInfoBytes(),
 	})
-	require.NoError(t, err)
-	require.True(t, new)
-	require.Nil(t, tt.Info())
+	qt.Assert(t, qt.IsTrue(new))
+	qt.Assert(t, qt.IsNil(tt.Info()))
 	_, new, err = cl.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
-	require.NoError(t, err)
-	require.False(t, new)
-	require.NotNil(t, tt.Info())
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.IsFalse(new))
+	qt.Assert(t, qt.IsNotNil(tt.Info()))
+}
+
+// A magnet link's source (xs) is fetched in the background and merged into the torrent. A good
+// source must give the torrent its info, and info that doesn't decode must fail the source with an
+// error rather than crash the whole client.
+func TestMagnetSourceMetainfo(t *testing.T) {
+	mi := testutil.GreetingMetaInfo()
+	good, err := bencode.Marshal(mi)
+	qt.Assert(t, qt.IsNil(err))
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr string // Empty if the source should give the torrent its info.
+	}{
+		{"valid", string(good), ""},
+		{"no info", "de", "unmarshalling info: EOF"},
+		{"info not a dict", "d4:infoi1ee", "unmarshalling info: .*"},
+		{"field of wrong type", "d4:infod12:piece length3:abcee", "unmarshalling info: .*"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			cl, err := NewClient(TestingConfig(t))
+			qt.Assert(t, qt.IsNil(err))
+			defer cl.Close()
+			tor, err := cl.AddMagnet("magnet:?xt=urn:btih:" + mi.HashInfoBytes().HexString() + "&xs=" + url.QueryEscape(srv.URL))
+			qt.Assert(t, qt.IsNil(err))
+			if tc.wantErr == "" {
+				select {
+				case <-tor.GotInfo():
+				case <-time.After(10 * time.Second):
+					t.Fatal("didn't get info from the source")
+				}
+				return
+			}
+			// The source stores its error when it gives up.
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				if v, _ := tor.activeSources.Load(srv.URL); v != nil {
+					qt.Assert(t, qt.ErrorMatches(v.(error), tc.wantErr))
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("source didn't finish")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			qt.Assert(t, qt.IsNil(tor.Info()))
+		})
+	}
 }
 
 func TestTorrentDroppedBeforeGotInfo(t *testing.T) {
 	dir, mi := testutil.GreetingTestTorrent()
 	os.RemoveAll(dir)
-	cl, _ := NewClient(TestingConfig())
+	cl, _ := NewClient(TestingConfig(t))
 	defer cl.Close()
-	tt, _, _ := cl.AddTorrentSpec(&TorrentSpec{
+	tt, _ := cl.AddTorrentOpt(AddTorrentOpts{
 		InfoHash: mi.HashInfoBytes(),
 	})
 	tt.Drop()
-	assert.EqualValues(t, 0, len(cl.Torrents()))
+	qt.Check(t, qt.Equals(len(cl.Torrents()), 0))
 	select {
 	case <-tt.GotInfo():
 		t.FailNow()
@@ -366,52 +507,50 @@ func TestTorrentDroppedBeforeGotInfo(t *testing.T) {
 }
 
 func writeTorrentData(ts *storage.Torrent, info metainfo.Info, b []byte) {
-	for i := range iter.N(info.NumPieces()) {
+	for i := 0; i < info.NumPieces(); i += 1 {
 		p := info.Piece(i)
 		ts.Piece(p).WriteAt(b[p.Offset():p.Offset()+p.Length()], 0)
 	}
 }
 
 func testAddTorrentPriorPieceCompletion(t *testing.T, alreadyCompleted bool, csf func(*filecache.Cache) storage.ClientImpl) {
-	fileCacheDir, err := ioutil.TempDir("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(fileCacheDir)
+	fileCacheDir := t.TempDir()
 	fileCache, err := filecache.NewCache(fileCacheDir)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	greetingDataTempDir, greetingMetainfo := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(greetingDataTempDir)
 	filePieceStore := csf(fileCache)
 	info, err := greetingMetainfo.UnmarshalInfo()
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	ih := greetingMetainfo.HashInfoBytes()
-	greetingData, err := storage.NewClient(filePieceStore).OpenTorrent(&info, ih)
-	require.NoError(t, err)
+	greetingData, err := storage.NewClient(filePieceStore).OpenTorrent(context.Background(), &info, ih)
+	qt.Assert(t, qt.IsNil(err))
 	writeTorrentData(greetingData, info, []byte(testutil.GreetingFileContents))
-	// require.Equal(t, len(testutil.GreetingFileContents), written)
-	// require.NoError(t, err)
+	// qt.Assert(t, qt.Equals(written, len(testutil.GreetingFileContents)))
+	// qt.Assert(t, qt.IsNil(err))
 	for i := 0; i < info.NumPieces(); i++ {
 		p := info.Piece(i)
 		if alreadyCompleted {
-			require.NoError(t, greetingData.Piece(p).MarkComplete())
+			qt.Assert(t, qt.IsNil(greetingData.Piece(p).MarkComplete()))
 		}
 	}
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	// TODO: Disable network option?
 	cfg.DisableTCP = true
 	cfg.DisableUTP = true
 	cfg.DefaultStorage = filePieceStore
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	tt, err := cl.AddTorrent(greetingMetainfo)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	psrs := tt.PieceStateRuns()
-	assert.Len(t, psrs, 1)
-	assert.EqualValues(t, 3, psrs[0].Length)
-	assert.Equal(t, alreadyCompleted, psrs[0].Complete)
+	qt.Check(t, qt.HasLen(psrs, 1))
+	qt.Check(t, qt.Equals(psrs[0].Length, 3))
+	qt.Check(t, qt.Equals(psrs[0].Complete, alreadyCompleted))
 	if alreadyCompleted {
 		r := tt.NewReader()
-		quicktest.Check(t, iotest.TestReader(r, []byte(testutil.GreetingFileContents)), quicktest.IsNil)
+		qt.Check(t, qt.IsNil(iotest.TestReader(r, []byte(testutil.GreetingFileContents))))
 	}
 }
 
@@ -424,7 +563,7 @@ func TestAddTorrentPiecesNotAlreadyCompleted(t *testing.T) {
 }
 
 func TestAddMetainfoWithNodes(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.ListenHost = func(string) string { return "" }
 	cfg.NoDHT = false
 	cfg.DhtStartingNodes = func(string) dht.StartingNodesGetter { return func() ([]dht.Addr, error) { return nil, nil } }
@@ -432,7 +571,7 @@ func TestAddMetainfoWithNodes(t *testing.T) {
 	// DHT code doesn't support mixing secure and insecure nodes if security is enabled (yet).
 	// cfg.DHTConfig.NoSecurity = true
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	sum := func() (ret int64) {
 		cl.eachDhtServer(func(s DhtServer) {
@@ -440,12 +579,12 @@ func TestAddMetainfoWithNodes(t *testing.T) {
 		})
 		return
 	}
-	assert.EqualValues(t, 0, sum())
+	qt.Check(t, qt.Equals(sum(), 0))
 	tt, err := cl.AddTorrentFromFile("metainfo/testdata/issue_65a.torrent")
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	// Nodes are not added or exposed in Torrent's metainfo. We just randomly
 	// check if the announce-list is here instead. TODO: Add nodes.
-	assert.Len(t, tt.metainfo.AnnounceList, 5)
+	qt.Check(t, qt.HasLen(tt.announceList, 5))
 	// There are 6 nodes in the torrent file.
 	for sum() != int64(6*len(cl.dhtServers)) {
 		time.Sleep(time.Millisecond)
@@ -461,27 +600,25 @@ type testDownloadCancelParams struct {
 func testDownloadCancel(t *testing.T, ps testDownloadCancelParams) {
 	greetingTempDir, mi := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(greetingTempDir)
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.Seed = true
 	cfg.DataDir = greetingTempDir
 	seeder, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer seeder.Close()
 	defer testutil.ExportStatusWriter(seeder, "s", t)()
 	seederTorrent, _, _ := seeder.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
 	seederTorrent.VerifyData()
-	leecherDataDir, err := ioutil.TempDir("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(leecherDataDir)
+	leecherDataDir := t.TempDir()
 	fc, err := filecache.NewCache(leecherDataDir)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	if ps.SetLeecherStorageCapacity {
 		fc.SetCapacity(ps.LeecherStorageCapacity)
 	}
 	cfg.DefaultStorage = storage.NewResourcePieces(fc.AsResourceProvider())
 	cfg.DataDir = leecherDataDir
 	leecher, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer leecher.Close()
 	defer testutil.ExportStatusWriter(leecher, "l", t)()
 	leecherGreeting, new, err := leecher.AddTorrentSpec(func() (ret *TorrentSpec) {
@@ -489,15 +626,15 @@ func testDownloadCancel(t *testing.T, ps testDownloadCancelParams) {
 		ret.ChunkSize = 2
 		return
 	}())
-	require.NoError(t, err)
-	assert.True(t, new)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.IsTrue(new))
 	psc := leecherGreeting.SubscribePieceStateChanges()
 	defer psc.Close()
 
 	leecherGreeting.cl.lock()
 	leecherGreeting.downloadPiecesLocked(0, leecherGreeting.numPieces())
 	if ps.Cancel {
-		leecherGreeting.cancelPiecesLocked(0, leecherGreeting.NumPieces())
+		leecherGreeting.cancelPiecesLocked(0, leecherGreeting.NumPieces(), "")
 	}
 	leecherGreeting.cl.unlock()
 	done := make(chan struct{})
@@ -512,8 +649,7 @@ func testDownloadCancel(t *testing.T, ps testDownloadCancelParams) {
 		}
 	}()
 	for !reflect.DeepEqual(completes, expected) {
-		_v := <-psc.Values
-		v := _v.(PieceStateChange)
+		v := <-psc.Values
 		completes[v.Index] = v.Complete
 	}
 }
@@ -530,10 +666,10 @@ func TestTorrentDownloadAllThenCancel(t *testing.T) {
 
 // Ensure that it's an error for a peer to send an invalid have message.
 func TestPeerInvalidHave(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DropMutuallyCompletePeers = false
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	info := metainfo.Info{
 		PieceLength: 1,
@@ -541,67 +677,74 @@ func TestPeerInvalidHave(t *testing.T) {
 		Files:       []metainfo.FileInfo{{Length: 1}},
 	}
 	infoBytes, err := bencode.Marshal(info)
-	require.NoError(t, err)
-	tt, _new, err := cl.AddTorrentSpec(&TorrentSpec{
+	qt.Assert(t, qt.IsNil(err))
+	tt, _new := cl.AddTorrentOpt(AddTorrentOpts{
 		InfoBytes: infoBytes,
 		InfoHash:  metainfo.HashBytes(infoBytes),
 		Storage:   badStorage{},
 	})
-	require.NoError(t, err)
-	assert.True(t, _new)
+	qt.Check(t, qt.IsTrue(_new))
 	defer tt.Drop()
 	cn := &PeerConn{Peer: Peer{
-		t: tt,
+		t:         tt,
+		callbacks: &cfg.Callbacks,
 	}}
-	cn.peerImpl = cn
-	assert.NoError(t, cn.peerSentHave(0))
-	assert.Error(t, cn.peerSentHave(1))
+	tt.conns[cn] = struct{}{}
+	cn.legacyPeerImpl = cn
+	cl.lock()
+	defer cl.unlock()
+	qt.Check(t, qt.IsNil(cn.peerSentHave(0)))
+	qt.Check(t, qt.IsNotNil(cn.peerSentHave(1)))
 }
 
 func TestPieceCompletedInStorageButNotClient(t *testing.T) {
 	greetingTempDir, greetingMetainfo := testutil.GreetingTestTorrent()
 	defer os.RemoveAll(greetingTempDir)
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DataDir = greetingTempDir
-	seeder, err := NewClient(TestingConfig())
-	require.NoError(t, err)
-	seeder.AddTorrentSpec(&TorrentSpec{
+	seeder, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
+	defer seeder.Close()
+	_, new := seeder.AddTorrentOpt(AddTorrentOpts{
 		InfoBytes: greetingMetainfo.InfoBytes,
+		InfoHash:  greetingMetainfo.HashInfoBytes(),
 	})
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.IsTrue(new))
 }
 
 // Check that when the listen port is 0, all the protocols listened on have
 // the same port, and it isn't zero.
 func TestClientDynamicListenPortAllProtocols(t *testing.T) {
-	cl, err := NewClient(TestingConfig())
-	require.NoError(t, err)
+	cl, err := NewClient(TestingConfig(t))
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
 	port := cl.LocalPort()
-	assert.NotEqual(t, 0, port)
+	qt.Check(t, qt.Not(qt.Equals(port, 0)))
 	cl.eachListener(func(s Listener) bool {
-		assert.Equal(t, port, missinggo.AddrPort(s.Addr()))
+		qt.Check(t, qt.Equals(missinggo.AddrPort(s.Addr()), port))
 		return true
 	})
 }
 
 func TestClientDynamicListenTCPOnly(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DisableUTP = true
 	cfg.DisableTCP = false
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
-	assert.NotEqual(t, 0, cl.LocalPort())
+	qt.Check(t, qt.Not(qt.Equals(cl.LocalPort(), 0)))
 }
 
 func TestClientDynamicListenUTPOnly(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DisableTCP = true
 	cfg.DisableUTP = false
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
-	assert.NotEqual(t, 0, cl.LocalPort())
+	qt.Check(t, qt.Not(qt.Equals(cl.LocalPort(), 0)))
 }
 
 func totalConns(tts []*Torrent) (ret int) {
@@ -616,12 +759,12 @@ func totalConns(tts []*Torrent) (ret int) {
 func TestSetMaxEstablishedConn(t *testing.T) {
 	var tts []*Torrent
 	ih := testutil.GreetingMetaInfo().HashInfoBytes()
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DisableAcceptRateLimiting = true
 	cfg.DropDuplicatePeerIds = true
-	for i := range iter.N(3) {
+	for i := 0; i < 3; i += 1 {
 		cl, err := NewClient(cfg)
-		require.NoError(t, err)
+		qt.Assert(t, qt.IsNil(err))
 		defer cl.Close()
 		tt, _ := cl.AddTorrentInfoHash(ih)
 		tt.SetMaxEstablishedConns(2)
@@ -659,23 +802,25 @@ func TestSetMaxEstablishedConn(t *testing.T) {
 
 // Creates a file containing its own name as data. Make a metainfo from that, adds it to the given
 // client, and returns a magnet link.
-func makeMagnet(t *testing.T, cl *Client, dir string, name string) string {
-	os.MkdirAll(dir, 0770)
+func makeMagnet(t *testing.T, cl *Client, dir, name string) string {
+	os.MkdirAll(dir, 0o770)
 	file, err := os.Create(filepath.Join(dir, name))
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	file.Write([]byte(name))
 	file.Close()
 	mi := metainfo.MetaInfo{}
 	mi.SetDefaults()
 	info := metainfo.Info{PieceLength: 256 * 1024}
 	err = info.BuildFromFilePath(filepath.Join(dir, name))
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	mi.InfoBytes, err = bencode.Marshal(info)
-	require.NoError(t, err)
-	magnet := mi.Magnet(name, mi.HashInfoBytes()).String()
+	qt.Assert(t, qt.IsNil(err))
+	m, err := mi.MagnetV2()
+	qt.Assert(t, qt.IsNil(err))
+	magnet := m.String()
 	tr, err := cl.AddTorrent(&mi)
-	require.NoError(t, err)
-	require.True(t, tr.Seeding())
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.IsTrue(tr.Seeding()))
 	tr.VerifyData()
 	return magnet
 }
@@ -696,14 +841,14 @@ func TestMultipleTorrentsWithEncryption(t *testing.T) {
 
 // Test that the leecher can download a torrent in its entirety from the seeder. Note that the
 // seeder config is done first.
-func testSeederLeecherPair(t *testing.T, seeder func(*ClientConfig), leecher func(*ClientConfig)) {
-	cfg := TestingConfig()
+func testSeederLeecherPair(t *testing.T, seeder, leecher func(*ClientConfig)) {
+	cfg := TestingConfig(t)
 	cfg.Seed = true
 	cfg.DataDir = filepath.Join(cfg.DataDir, "server")
-	os.Mkdir(cfg.DataDir, 0755)
+	os.Mkdir(cfg.DataDir, 0o755)
 	seeder(cfg)
 	server, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer server.Close()
 	defer testutil.ExportStatusWriter(server, "s", t)()
 	magnet1 := makeMagnet(t, server, cfg.DataDir, "test1")
@@ -711,17 +856,17 @@ func testSeederLeecherPair(t *testing.T, seeder func(*ClientConfig), leecher fun
 	// against more than one torrent. See issue #114
 	makeMagnet(t, server, cfg.DataDir, "test2")
 	for i := 0; i < 100; i++ {
-		makeMagnet(t, server, cfg.DataDir, fmt.Sprintf("test%d", i+2))
+		makeMagnet(t, server, cfg.DataDir, fmt.Sprintf("test%d", i+3))
 	}
-	cfg = TestingConfig()
+	cfg = TestingConfig(t)
 	cfg.DataDir = filepath.Join(cfg.DataDir, "client")
 	leecher(cfg)
 	client, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer client.Close()
 	defer testutil.ExportStatusWriter(client, "c", t)()
 	tr, err := client.AddMagnet(magnet1)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	tr.AddClientPeer(server)
 	<-tr.GotInfo()
 	tr.DownloadAll()
@@ -760,59 +905,134 @@ func TestObfuscatedHeaderFallbackSeederRequiresLeecherPrefersNot(t *testing.T) {
 }
 
 func TestClientAddressInUse(t *testing.T) {
-	s, _ := NewUtpSocket("udp", ":50007", nil)
+	s, _ := NewUtpSocket("udp", "localhost:50007", nil, log.Default)
 	if s != nil {
 		defer s.Close()
 	}
-	cfg := TestingConfig().SetListenAddr(":50007")
+	cfg := TestingConfig(t).SetListenAddr("localhost:50007")
+	cfg.DisableUTP = false
 	cl, err := NewClient(cfg)
-	require.Error(t, err)
-	require.Nil(t, cl)
+	if err == nil {
+		qt.Check(t, qt.IsNil(cl.Close()))
+	}
+	qt.Assert(t, qt.IsNotNil(err))
+	qt.Assert(t, qt.IsNil(cl))
 }
 
 func TestClientHasDhtServersWhenUtpDisabled(t *testing.T) {
-	cc := TestingConfig()
+	cc := TestingConfig(t)
 	cc.DisableUTP = true
 	cc.NoDHT = false
 	cl, err := NewClient(cc)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
-	assert.NotEmpty(t, cl.DhtServers())
-}
-
-func TestIssue335(t *testing.T) {
-	dir, mi := testutil.GreetingTestTorrent()
-	defer os.RemoveAll(dir)
-	cfg := TestingConfig()
-	cfg.Seed = false
-	cfg.Debug = true
-	cfg.DataDir = dir
-	comp, err := storage.NewBoltPieceCompletion(dir)
-	require.NoError(t, err)
-	defer comp.Close()
-	cfg.DefaultStorage = storage.NewMMapWithCompletion(dir, comp)
-	cl, err := NewClient(cfg)
-	require.NoError(t, err)
-	defer cl.Close()
-	tor, new, err := cl.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
-	require.NoError(t, err)
-	assert.True(t, new)
-	require.True(t, cl.WaitAll())
-	tor.Drop()
-	_, new, err = cl.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
-	require.NoError(t, err)
-	assert.True(t, new)
-	require.True(t, cl.WaitAll())
+	qt.Check(t, qt.Not(qt.HasLen(cl.DhtServers(), 0)))
 }
 
 func TestClientDisabledImplicitNetworksButDhtEnabled(t *testing.T) {
-	cfg := TestingConfig()
+	cfg := TestingConfig(t)
 	cfg.DisableTCP = true
 	cfg.DisableUTP = true
 	cfg.NoDHT = false
 	cl, err := NewClient(cfg)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	defer cl.Close()
-	assert.Empty(t, cl.listeners)
-	assert.NotEmpty(t, cl.DhtServers())
+	qt.Check(t, qt.HasLen(cl.listeners, 0))
+	qt.Check(t, qt.Not(qt.HasLen(cl.DhtServers(), 0)))
+}
+
+func TestBadPeerIpPort(t *testing.T) {
+	for _, tc := range []struct {
+		title      string
+		ip         net.IP
+		port       int
+		expectedOk bool
+		setup      func(*Client)
+	}{
+		{"empty both", nil, 0, true, func(*Client) {}},
+		{"empty/nil ip", nil, 6666, true, func(*Client) {}},
+		{
+			"empty port",
+			net.ParseIP("127.0.0.1/32"),
+			0, true,
+			func(*Client) {},
+		},
+		{
+			"in doppleganger addresses",
+			net.ParseIP("127.0.0.1/32"),
+			2322,
+			true,
+			func(cl *Client) {
+				cl.dopplegangerAddrs["10.0.0.1:2322"] = struct{}{}
+			},
+		},
+		{
+			"in IP block list",
+			net.ParseIP("10.0.0.1"),
+			2322,
+			true,
+			func(cl *Client) {
+				cl.ipBlockList = iplist.New([]iplist.Range{
+					{First: net.ParseIP("10.0.0.1"), Last: net.ParseIP("10.0.0.255")},
+				})
+			},
+		},
+		{
+			"in bad peer IPs",
+			net.ParseIP("10.0.0.1"),
+			2322,
+			true,
+			func(cl *Client) {
+				ipAddr, ok := netip.AddrFromSlice(net.ParseIP("10.0.0.1"))
+				qt.Assert(t, qt.IsTrue(ok))
+				cl.badPeerIPs = map[netip.Addr]struct{}{}
+				cl.badPeerIPs[ipAddr] = struct{}{}
+			},
+		},
+		{
+			"good",
+			net.ParseIP("10.0.0.1"),
+			2322,
+			false,
+			func(cl *Client) {},
+		},
+	} {
+		t.Run(tc.title, func(t *testing.T) {
+			cfg := TestingConfig(t)
+			cfg.DisableTCP = true
+			cfg.DisableUTP = true
+			cfg.NoDHT = false
+			cl, err := NewClient(cfg)
+			qt.Assert(t, qt.IsNil(err))
+			defer cl.Close()
+
+			tc.setup(cl)
+			qt.Assert(t, qt.Equals(cl.badPeerIPPort(tc.ip, tc.port), tc.expectedOk))
+		})
+	}
+}
+
+// https://github.com/anacrolix/torrent/issues/837
+func TestClientConfigSetHandlerNotIgnored(t *testing.T) {
+	cfg := TestingConfig(t)
+	cfg.Logger.SetHandlers(log.DiscardHandler)
+	cl, err := NewClient(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	defer cl.Close()
+	qt.Assert(t, qt.HasLen(cl.logger.Handlers, 1))
+	h := cl.logger.Handlers[0].(log.StreamHandler)
+	qt.Check(t, qt.Equals(h.W, io.Discard))
+}
+
+func TestDroppedTorrentsNotReturned(t *testing.T) {
+	cl := newTestingClient(t)
+	tt, _ := cl.AddTorrentOpt(testingAddTorrentOpts)
+	tt1, ok := cl.Torrent(tt.InfoHash())
+	qt.Check(t, qt.IsTrue(ok))
+	qt.Check(t, qt.Equals(tt1, tt))
+	qt.Check(t, qt.SliceContains(cl.Torrents(), tt))
+	tt.Drop()
+	_, ok = cl.Torrent(tt.InfoHash())
+	qt.Check(t, qt.IsFalse(ok))
+	qt.Check(t, qt.HasLen(cl.Torrents(), 0))
 }

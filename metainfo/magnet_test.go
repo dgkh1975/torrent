@@ -4,8 +4,8 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/davecgh/go-spew/spew"
+	qt "github.com/go-quicktest/qt"
 )
 
 var (
@@ -26,8 +26,8 @@ func init() {
 // Converting from our Magnet type to URL string.
 func TestMagnetString(t *testing.T) {
 	m, err := ParseMagnetUri(exampleMagnet.String())
-	require.NoError(t, err)
-	assert.EqualValues(t, exampleMagnet, m)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.DeepEquals(m, exampleMagnet))
 }
 
 func TestParseMagnetURI(t *testing.T) {
@@ -44,8 +44,8 @@ func TestParseMagnetURI(t *testing.T) {
 
 	// Checking if the magnet instance struct is built correctly from parsing
 	m, err = ParseMagnetUri(exampleMagnetURI)
-	assert.EqualValues(t, exampleMagnet, m)
-	assert.NoError(t, err)
+	qt.Check(t, qt.DeepEquals(m, exampleMagnet))
+	qt.Check(t, qt.IsNil(err))
 
 	// empty string URI case
 	_, err = ParseMagnetUri("")
@@ -67,18 +67,17 @@ func TestParseMagnetURI(t *testing.T) {
 	if err == nil {
 		t.Errorf("Failed to detect broken Magnet URI: %v", uri)
 	}
-
 }
 
 func TestMagnetize(t *testing.T) {
 	mi, err := LoadFromFile("../testdata/bootstrap.dat.torrent")
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 
 	info, err := mi.UnmarshalInfo()
-	require.NoError(t, err)
-	m := mi.Magnet(info.Name, mi.HashInfoBytes())
+	qt.Assert(t, qt.IsNil(err))
+	m := mi.Magnet(nil, &info)
 
-	assert.EqualValues(t, "bootstrap.dat", m.DisplayName)
+	qt.Check(t, qt.Equals(m.DisplayName, "bootstrap.dat"))
 
 	ih := [20]byte{
 		54, 113, 155, 162, 206, 207, 159, 59, 215, 197,
@@ -112,4 +111,22 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// Check that we can parse the magnet link generated from a real-world torrent. This was added due
+// to a regression in copyParams.
+func TestParseSintelMagnet(t *testing.T) {
+	mi, err := LoadFromFile("../testdata/sintel.torrent")
+	qt.Assert(t, qt.IsNil(err))
+	m := mi.Magnet(nil, nil)
+	ms := m.String()
+	t.Logf("magnet link: %q", ms)
+	m, err = ParseMagnetUri(ms)
+	qt.Check(t, qt.IsNil(err))
+	spewCfg := spew.NewDefaultConfig()
+	spewCfg.DisableMethods = true
+	spewCfg.Dump(m)
+	m2, err := ParseMagnetV2Uri(ms)
+	spewCfg.Dump(m2)
+	qt.Check(t, qt.IsNil(err))
 }

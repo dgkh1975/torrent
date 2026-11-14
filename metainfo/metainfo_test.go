@@ -2,29 +2,29 @@ package metainfo
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/anacrolix/missinggo"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/anacrolix/missinggo/v2"
+	"github.com/davecgh/go-spew/spew"
+	qt "github.com/go-quicktest/qt"
 
 	"github.com/anacrolix/torrent/bencode"
 )
 
 func testFile(t *testing.T, filename string) {
 	mi, err := LoadFromFile(filename)
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 	info, err := mi.UnmarshalInfo()
-	require.NoError(t, err)
+	qt.Assert(t, qt.IsNil(err))
 
 	if len(info.Files) == 1 {
-		t.Logf("Single file: %s (length: %d)\n", info.Name, info.Files[0].Length)
+		t.Logf("Single file: %s (length: %d)\n", info.BestName(), info.Files[0].Length)
 	} else {
-		t.Logf("Multiple files: %s\n", info.Name)
+		t.Logf("Multiple files: %s\n", info.BestName())
 		for _, f := range info.Files {
 			t.Logf(" - %s (length: %d)\n", path.Join(f.Path...), f.Length)
 		}
@@ -37,8 +37,8 @@ func testFile(t *testing.T, filename string) {
 	}
 
 	b, err := bencode.Marshal(&info)
-	require.NoError(t, err)
-	assert.EqualValues(t, string(b), string(mi.InfoBytes))
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(string(mi.InfoBytes), string(b)))
 }
 
 func TestFile(t *testing.T) {
@@ -46,6 +46,8 @@ func TestFile(t *testing.T) {
 	testFile(t, "testdata/continuum.torrent")
 	testFile(t, "testdata/23516C72685E8DB0C8F15553382A927F185C4F01.torrent")
 	testFile(t, "testdata/trackerless.torrent")
+	_, err := LoadFromFile("testdata/minimal-trailing-newline.torrent")
+	qt.Check(t, qt.ErrorMatches(err, ".*expected EOF"))
 }
 
 // Ensure that the correct number of pieces are generated when hashing files.
@@ -66,10 +68,10 @@ func TestNumPieces(t *testing.T) {
 			PieceLength: _case.PieceLength,
 		}
 		err := info.GeneratePieces(func(fi FileInfo) (io.ReadCloser, error) {
-			return ioutil.NopCloser(missinggo.ZeroReader), nil
+			return io.NopCloser(missinggo.ZeroReader), nil
 		})
-		assert.NoError(t, err)
-		assert.EqualValues(t, _case.NumPieces, info.NumPieces())
+		qt.Check(t, qt.IsNil(err))
+		qt.Check(t, qt.Equals(info.NumPieces(), _case.NumPieces))
 	}
 }
 
@@ -83,31 +85,29 @@ func touchFile(path string) (err error) {
 }
 
 func TestBuildFromFilePathOrder(t *testing.T) {
-	td, err := ioutil.TempDir("", "anacrolix")
-	require.NoError(t, err)
-	defer os.RemoveAll(td)
-	require.NoError(t, touchFile(filepath.Join(td, "b")))
-	require.NoError(t, touchFile(filepath.Join(td, "a")))
+	td := t.TempDir()
+	qt.Assert(t, qt.IsNil(touchFile(filepath.Join(td, "b"))))
+	qt.Assert(t, qt.IsNil(touchFile(filepath.Join(td, "a"))))
 	info := Info{
 		PieceLength: 1,
 	}
-	require.NoError(t, info.BuildFromFilePath(td))
-	assert.EqualValues(t, []FileInfo{{
+	qt.Assert(t, qt.IsNil(info.BuildFromFilePath(td)))
+	qt.Check(t, qt.DeepEquals(info.Files, []FileInfo{{
 		Path: []string{"a"},
 	}, {
 		Path: []string{"b"},
-	}}, info.Files)
+	}}))
 }
 
 func testUnmarshal(t *testing.T, input string, expected *MetaInfo) {
 	var actual MetaInfo
 	err := bencode.Unmarshal([]byte(input), &actual)
 	if expected == nil {
-		assert.Error(t, err)
+		qt.Check(t, qt.IsNotNil(err))
 		return
 	}
-	assert.NoError(t, err)
-	assert.EqualValues(t, *expected, actual)
+	qt.Check(t, qt.IsNil(err))
+	qt.Check(t, qt.DeepEquals(actual, *expected))
 }
 
 func TestUnmarshal(t *testing.T) {
@@ -119,14 +119,30 @@ func TestUnmarshal(t *testing.T) {
 
 func TestMetainfoWithListURLList(t *testing.T) {
 	mi, err := LoadFromFile("testdata/SKODAOCTAVIA336x280_archive.torrent")
-	require.NoError(t, err)
-	assert.Len(t, mi.UrlList, 3)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.HasLen(mi.UrlList, 3))
+	qt.Assert(t, qt.ContentEquals(mi.Magnet(nil, nil).String(),
+		strings.Join([]string{
+			"magnet:?xt=urn:btih:d4b197dff199aad447a9a352e31528adbbd97922",
+			"tr=http%3A%2F%2Fbt1.archive.org%3A6969%2Fannounce",
+			"tr=http%3A%2F%2Fbt2.archive.org%3A6969%2Fannounce",
+			"ws=https%3A%2F%2Farchive.org%2Fdownload%2F",
+			"ws=http%3A%2F%2Fia601600.us.archive.org%2F26%2Fitems%2F",
+			"ws=http%3A%2F%2Fia801600.us.archive.org%2F26%2Fitems%2F",
+		}, "&")))
 }
 
 func TestMetainfoWithStringURLList(t *testing.T) {
 	mi, err := LoadFromFile("testdata/flat-url-list.torrent")
-	require.NoError(t, err)
-	assert.Len(t, mi.UrlList, 1)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.HasLen(mi.UrlList, 1))
+	qt.Assert(t, qt.ContentEquals(mi.Magnet(nil, nil).String(),
+		strings.Join([]string{
+			"magnet:?xt=urn:btih:9da24e606e4ed9c7b91c1772fb5bf98f82bd9687",
+			"tr=http%3A%2F%2Fbt1.archive.org%3A6969%2Fannounce",
+			"tr=http%3A%2F%2Fbt2.archive.org%3A6969%2Fannounce",
+			"ws=https%3A%2F%2Farchive.org%2Fdownload%2F",
+		}, "&")))
 }
 
 // https://github.com/anacrolix/torrent/issues/247
@@ -135,5 +151,23 @@ func TestMetainfoWithStringURLList(t *testing.T) {
 // a syntax error on a field with the ignore_unmarshal_type_error tag.
 func TestStringCreationDate(t *testing.T) {
 	var mi MetaInfo
-	assert.NoError(t, bencode.Unmarshal([]byte("d13:creation date23:29.03.2018 22:18:14 UTC4:infodee"), &mi))
+	qt.Check(t, qt.IsNil(bencode.Unmarshal([]byte("d13:creation date23:29.03.2018 22:18:14 UTC4:infodee"), &mi)))
+}
+
+// See https://github.com/anacrolix/torrent/issues/843.
+func TestUnmarshalEmptyStringNodes(t *testing.T) {
+	var mi MetaInfo
+	err := bencode.Unmarshal([]byte("d5:nodes0:e"), &mi)
+	qt.Assert(t, qt.IsNil(err))
+}
+
+func TestUnmarshalV2Metainfo(t *testing.T) {
+	mi, err := LoadFromFile("../testdata/bittorrent-v2-test.torrent")
+	qt.Assert(t, qt.IsNil(err))
+	info, err := mi.UnmarshalInfo()
+	qt.Assert(t, qt.IsNil(err))
+	spew.Dump(info)
+	qt.Check(t, qt.Not(qt.Equals(info.NumPieces(), 0)))
+	err = ValidatePieceLayers(mi.PieceLayers, &info.FileTree, info.PieceLength)
+	qt.Check(t, qt.IsNil(err))
 }

@@ -1,10 +1,11 @@
 package test
 
 import (
+	"log"
+
 	_ "github.com/anacrolix/envpprof"
-	"github.com/anacrolix/torrent"
 )
 
 func init() {
-	torrent.TestingTempDir.Init("torrent-test.test")
+	log.SetFlags(log.Flags() | log.Lshortfile)
 }
